@@ -2451,6 +2451,7 @@ dependencies = [
  "etcetera",
  "hound",
  "iced",
+ "iced_renderer",
  "iced_runtime",
  "iced_wgpu",
  "iced_winit",
