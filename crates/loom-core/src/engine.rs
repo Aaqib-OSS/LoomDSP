@@ -180,13 +180,13 @@ pub(crate) enum Command {
     Panic,
     /// The MIDI message that runs panic, from the player's preferences.
     SetPanicTrigger(Option<PanicTrigger>),
-    /// Start tracking the notes of MIDI input `index`, in `held`.
+    /// Start tracking MIDI input `input`, preserving its retained configuration.
     OpenInput {
-        index: usize,
+        input: crate::MidiInputId,
         held: Box<HeldSet>,
     },
-    /// Release every note MIDI input `index` holds, and stop tracking it.
-    ReleaseInput(usize),
+    /// Release every note MIDI input `input` holds, and stop tracking it.
+    ReleaseInput(crate::MidiInputId),
 }
 
 pub(crate) enum Garbage {
@@ -194,16 +194,15 @@ pub(crate) enum Garbage {
     Schedule(#[expect(dead_code, reason = "dropped on the control thread")] Box<Schedule>),
     HeldSet(#[expect(dead_code, reason = "dropped on the control thread")] Box<HeldSet>),
     Input(#[expect(dead_code, reason = "dropped on the control thread")] crate::audio_input::InputReader),
+    MidiConfig(#[expect(dead_code, reason = "dropped on the control thread")] Box<crate::MidiConfigTable>),
 }
 
-/// Notes held per tracked MIDI input, and how many inputs hold each note
+/// Notes held per tracked MIDI input
 /// (`docs/design/device-changes.md`, Held notes belong to an input). All
 /// memory is allocated when the engine is built or arrives by command.
 struct InputNotes {
     /// One set per open input, by id. `None` for an input that is not open.
     inputs: Box<[Option<Box<HeldSet>>]>,
-    /// How many open inputs hold each note: channel * 128 + note.
-    holders: Box<[u8]>,
     /// Note offs from released inputs, sent at the start of the next
     /// buffer.
     releases: Vec<MidiEvent>,
@@ -213,14 +212,11 @@ impl InputNotes {
     fn new() -> Self {
         Self {
             inputs: (0..MAX_MIDI_INPUTS).map(|_| None).collect(),
-            holders: vec![0; 16 * 128].into_boxed_slice(),
-            releases: Vec::with_capacity(16 * 128),
+            releases: Vec::with_capacity(usize::from(MAX_MIDI_INPUTS - 1) * 16 * 128),
         }
     }
 
-    /// Follows one event. Returns false if the modules must not see it:
-    /// it comes from an input that is not open, or it is a note off for a
-    /// note another input still holds.
+    /// Follows each source independently. Every genuine note off remains visible.
     fn follow(&mut self, event: &MidiEvent) -> bool {
         if event.input == 0 {
             return true;
@@ -229,36 +225,21 @@ impl InputNotes {
             return false;
         };
         match event.message() {
-            MidiMessage::NoteOn { channel, note, .. } if !held.has(channel, note) => {
-                held.set(channel, note, true);
-                let count = &mut self.holders[usize::from(channel) * 128 + usize::from(note)];
-                *count = count.saturating_add(1);
-                true
-            }
-            MidiMessage::NoteOff { channel, note } if held.has(channel, note) => {
-                held.set(channel, note, false);
-                let count = &mut self.holders[usize::from(channel) * 128 + usize::from(note)];
-                *count = count.saturating_sub(1);
-                *count == 0
-            }
-            _ => true,
+            MidiMessage::NoteOn { channel, note, .. } => held.set(channel, note, true),
+            MidiMessage::NoteOff { channel, note } => held.set(channel, note, false),
+            _ => {}
         }
+        true
     }
 
-    /// Takes input `index`'s set away, and queues a note off for each note
-    /// no other input holds. Returns the set, for freeing.
-    fn release(&mut self, index: usize) -> Option<Box<HeldSet>> {
+    /// Queues tagged releases for every held identity on this input.
+    fn release(&mut self, input: crate::MidiInputId) -> Option<Box<HeldSet>> {
+        let index = usize::from(input.0);
         let mut held = self.inputs.get_mut(index)?.take()?;
-        let (holders, releases) = (&mut self.holders, &mut self.releases);
         held.drain(|channel, note| {
-            let count = &mut holders[usize::from(channel) * 128 + usize::from(note)];
-            *count = count.saturating_sub(1);
-            // The list holds every note of every channel, and the set has
-            // each note once, so it only fills when several inputs are
-            // released in one buffer. A dropped note off is then a note that
-            // the next release or panic clears.
-            if *count == 0 && releases.len() < releases.capacity() {
-                releases.push(MidiEvent::note_off(0, channel, note));
+            if self.releases.len() < self.releases.capacity() {
+                self.releases
+                    .push(MidiEvent::note_off(0, channel, note).from_input(input));
             }
         });
         Some(held)
@@ -270,7 +251,6 @@ impl InputNotes {
         for held in self.inputs.iter_mut().flatten() {
             held.drain(|_, _| {});
         }
-        self.holders.fill(0);
         self.releases.clear();
     }
 }
@@ -289,6 +269,8 @@ pub struct Engine {
     restart_fade: Option<Consumer<()>>,
     garbage: Producer<Garbage>,
     midi_in: Consumer<MidiEvent>,
+    midi_config_in: Consumer<Box<crate::MidiConfigTable>>,
+    midi_config: crate::MidiConfigTimeline,
     midi: Vec<MidiEvent>,
     /// What MIDI mappings did, for the controller (MIDI learn).
     midi_feedback: Arc<MidiFeedback>,
@@ -335,7 +317,11 @@ impl Engine {
         config: EngineConfig,
         commands: Consumer<Command>,
         garbage: Producer<Garbage>,
-        (midi_in, midi_feedback): (Consumer<MidiEvent>, Arc<MidiFeedback>),
+        (midi_in, midi_config_in, midi_feedback): (
+            Consumer<MidiEvent>,
+            Consumer<Box<crate::MidiConfigTable>>,
+            Arc<MidiFeedback>,
+        ),
         telemetry: TelemetrySender,
         (displays, live): (Arc<DisplayTable>, Arc<LiveTable>),
         stats: Arc<EngineStats>,
@@ -350,6 +336,8 @@ impl Engine {
             restart_fade: None,
             garbage,
             midi_in,
+            midi_config_in,
+            midi_config: crate::MidiConfigTimeline::new(config.midi_capacity),
             midi: Vec::with_capacity(config.midi_capacity),
             midi_feedback,
             midi_states: vec![ControlState::NONE; MIDI_CONTROLS].into_boxed_slice(),
@@ -778,10 +766,11 @@ impl Engine {
                 Command::FadeOut => self.safety.fade_out(),
                 Command::Panic => self.start_panic(),
                 Command::SetPanicTrigger(trigger) => self.panic_trigger.set(trigger),
-                Command::OpenInput { index, held } => {
-                    // An input opened again starts clean: what it held is
-                    // released first.
-                    if let Some(old) = self.input_notes.release(index) {
+                Command::OpenInput { input, held } => {
+                    let index = usize::from(input.0);
+                    // Tracking an input again releases its old held notes.
+                    // Device configuration can already be seeded by the rig.
+                    if let Some(old) = self.input_notes.release(input) {
                         self.discard(Garbage::HeldSet(old));
                     }
                     match self.input_notes.inputs.get_mut(index) {
@@ -789,8 +778,9 @@ impl Engine {
                         None => self.discard(Garbage::HeldSet(held)),
                     }
                 }
-                Command::ReleaseInput(index) => {
-                    if let Some(old) = self.input_notes.release(index) {
+                Command::ReleaseInput(input) => {
+                    self.midi_config.clear(input.0);
+                    if let Some(old) = self.input_notes.release(input) {
                         self.discard(Garbage::HeldSet(old));
                     }
                 }
@@ -802,8 +792,8 @@ impl Engine {
     fn discard(&mut self, garbage: Garbage) {
         if let Err(rtrb::PushError::Full(garbage)) = self.garbage.push(garbage) {
             // Never free on the audio thread. Leaking is the lesser evil, and
-            // the counter makes it visible. The garbage queue has the same
-            // capacity as the command queue, so this should not happen.
+            // the counter makes it visible. The garbage queue covers the
+            // command queue plus the initial MIDI snapshot, so this should not happen.
             std::mem::forget(garbage);
             self.stats.leaked.fetch_add(1, Ordering::Relaxed);
         }
@@ -902,21 +892,32 @@ impl Engine {
 
     fn collect_midi(&mut self, frames: usize) {
         self.midi.clear();
+        while let Ok(mut config) = self.midi_config_in.pop() {
+            self.midi_config.swap(&mut config);
+            self.discard(Garbage::MidiConfig(config));
+        }
         // Note offs from inputs released since the last buffer go first.
-        for event in self.input_notes.releases.drain(..) {
-            if self.midi.len() == self.midi.capacity() {
-                self.stats.dropped_midi.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+        for event in self
+            .input_notes
+            .releases
+            .drain(..self.input_notes.releases.len().min(self.midi.capacity()))
+        {
             self.midi.push(event);
         }
+        // Finish synthetic releases before accepting new notes under a reused id.
+        // The bounded release list may span several buffers after a mass disconnect.
+        if !self.input_notes.releases.is_empty() {
+            self.midi_config.begin_block(&self.midi);
+            return;
+        }
         let last = frames.saturating_sub(1) as u32;
-        while let Ok(mut event) = self.midi_in.pop() {
+        // Releases share this buffer with ingress. Leave accepted events queued
+        // once it fills, rather than consuming a note that cannot be delivered.
+        while self.midi.len() < self.midi.capacity() {
+            let Ok(mut event) = self.midi_in.pop() else {
+                break;
+            };
             if !self.input_notes.follow(&event) {
-                continue;
-            }
-            if self.midi.len() == self.midi.capacity() {
-                self.stats.dropped_midi.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             event.frame = event.frame.min(last);
@@ -925,6 +926,7 @@ impl Engine {
             let at = self.midi.partition_point(|e| e.frame <= event.frame);
             self.midi.insert(at, event);
         }
+        self.midi_config.begin_block(&self.midi);
     }
 
     /// Sets the base value of every mapped parameter whose control change
@@ -1100,6 +1102,7 @@ impl Engine {
                 let ctx = ProcessContext {
                     sample_rate,
                     midi,
+                    midi_config: Some(&self.midi_config),
                     midi_base: position + offset,
                     frames: len,
                     transport: transport.later(offset),
