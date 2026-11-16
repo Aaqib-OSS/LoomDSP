@@ -79,7 +79,11 @@ fn engine_telemetry_reaches_levels_and_traces() {
 
     trace.update(960, Trigger::Auto, Slope::Rising);
     assert!(trace.triggered);
-    assert_eq!(trace.trace.len(), 961, "20 ms at 48 kHz, plus one sample");
+    assert_eq!(
+        trace.trace.len(),
+        962,
+        "20 ms at 48 kHz, plus two samples so the line reaches past both edges"
+    );
     assert_eq!(trace.range, 1.0);
     assert!(
         trace.trace[0] <= 0.0 && trace.trace[1] >= 0.0,
@@ -121,6 +125,45 @@ fn long_scope_window_keeps_short_peak() {
     assert!(trace.points.len() <= loom_canvas::MAX_TRACE_POINTS);
     assert!(trace.points.iter().any(|point| point[1] == 1.0));
     assert!(trace.points.windows(2).all(|pair| pair[0][0] <= pair[1][0]));
+}
+
+/// A reduced triggered trace still reaches past both edges of the frame
+/// (`docs/design/panels.md`, Drawing the scope trace, The line reaches past
+/// both edges). The window is a step: the sample before the trigger, a dip
+/// in the first group that is lower still, then a constant level, so the
+/// first group's lowest and highest lie inside the frame, and so does the
+/// constant last group's only point. The first and last samples are kept,
+/// within the point limit.
+#[test]
+fn a_reduced_trace_reaches_both_edges() {
+    let mut scope = ScopeTrace::new(48_000.0);
+    // One sample past a whole number of groups, so the constant last group
+    // holds two samples and its one point lies inside the frame.
+    let n = loom_canvas::MAX_TRACE_POINTS * 4 + 1;
+    scope.trace = vec![1.0; n];
+    scope.trace[0] = -0.5;
+    scope.trace[3] = -1.0;
+    scope.offset = 0.5;
+    scope.span = (n - 2) as f32;
+    let trace = scope.canvas_trace(true);
+    assert!(trace.points.len() <= loom_canvas::MAX_TRACE_POINTS);
+    assert!(trace.points[0][0] <= 0.0, "first x: {}", trace.points[0][0]);
+    let last = trace.points.last().unwrap();
+    assert!(last[0] >= 1.0, "last x: {}", last[0]);
+    assert!(trace.points.windows(2).all(|pair| pair[0][0] < pair[1][0]));
+    assert!(trace.points.iter().any(|p| p[1] == -1.0), "the dip still shows");
+
+    // A NaN at either end is skipped: the next sample with a value is kept.
+    scope.trace[0] = f32::NAN;
+    scope.trace[n - 1] = f32::NAN;
+    let trace = scope.canvas_trace(true);
+    assert!(all_finite(&trace));
+    assert_eq!(trace.points[0][0], 0.5 / scope.span, "the first value");
+    assert_eq!(
+        trace.points.last().unwrap()[0],
+        (n as f32 - 2.5) / scope.span,
+        "the last value"
+    );
 }
 
 fn reading(probe: u32, frames: u32, peak: f32, rms: f32) -> MeterReading {
@@ -422,4 +465,143 @@ fn a_falling_edge_near_the_top_still_arms() {
     trace.history.push(0, &samples);
     trace.update(480, Trigger::Level(0.99), Slope::Falling);
     assert!(trace.triggered);
+}
+
+/// A triggered trace takes `window + 2` samples, so after the shift by its
+/// fraction its first point lies at or left of x = 0 and its last at or
+/// right of x = 1. A short history has no start that leaves that many, so it
+/// runs free (panels.md, Drawing the scope trace, The line reaches past both
+/// edges).
+#[test]
+fn a_triggered_line_reaches_past_both_edges() {
+    let samples = sine(261.63, 48_000.0, 4800, 0.0);
+    let mut scope = ScopeTrace::new(48_000.0);
+    scope.history.push(0, &samples);
+    scope.update(240, Trigger::Auto, Slope::Rising);
+    assert!(scope.triggered);
+    assert_eq!(scope.trace.len(), 242);
+    let trace = scope.canvas_trace(true);
+    assert!(trace.points[0][0] <= 0.0);
+    assert!(trace.points.last().unwrap()[0] >= 1.0);
+
+    // One rising edge between samples 1 and 2. From the sample before it,
+    // 241 samples are too few for a window of 240, and 242 are enough.
+    let step: Vec<f32> = (0..243).map(|i| if i < 2 { -1.0 } else { 1.0 }).collect();
+    assert_eq!(find_trigger(&step[..242], 240, Trigger::Auto, Slope::Rising), None);
+    assert_eq!(find_trigger(&step, 240, Trigger::Auto, Slope::Rising), Some(1.5));
+}
+
+/// True when every point of `trace` has a finite x and y.
+fn all_finite(trace: &loom_canvas::Trace) -> bool {
+    trace.points.iter().flatten().all(|v| v.is_finite())
+}
+
+/// A NaN sample draws no point, in the full trace and in a reduced one, and
+/// the line joins the samples on each side. A group made only of NaN adds
+/// no point (panels.md, Drawing the scope trace, Values that are not finite).
+#[test]
+fn a_nan_in_the_window_draws_no_point() {
+    let mut scope = ScopeTrace::new(48_000.0);
+    scope.trace = sine(1000.0, 48_000.0, 241, 0.0);
+    scope.trace[100] = f32::NAN;
+    scope.span = 240.0;
+    let trace = scope.canvas_trace(true);
+    assert!(all_finite(&trace));
+    assert_eq!(trace.points.len(), 240, "one point left out");
+    assert!(trace.points.iter().all(|p| (p[0] * 240.0 - 100.0).abs() > 0.5));
+
+    // Reduced in groups of 9: samples 801 to 809 are one group, all NaN.
+    let n = loom_canvas::MAX_TRACE_POINTS * 4;
+    scope.trace = sine(100.0, 48_000.0, n, 0.0);
+    scope.trace[3] = f32::NAN;
+    scope.trace[801..810].fill(f32::NAN);
+    scope.span = n as f32;
+    let trace = scope.canvas_trace(true);
+    assert!(all_finite(&trace));
+    assert!(trace.points.len() <= loom_canvas::MAX_TRACE_POINTS);
+    assert!(
+        trace.points.iter().any(|p| p[0] * (n as f32) < 8.0),
+        "a group with one NaN keeps its points"
+    );
+    let in_gap = |p: &&[f32; 2]| (801.0..810.0).contains(&(p[0] * n as f32));
+    assert_eq!(
+        trace.points.iter().filter(in_gap).count(),
+        0,
+        "the NaN group adds no point"
+    );
+    assert!(trace.points.windows(2).all(|pair| pair[0][0] <= pair[1][0]));
+}
+
+/// A window of only NaN draws no line, and its level is 0.
+#[test]
+fn a_window_of_only_nan_draws_no_line() {
+    let mut scope = ScopeTrace::new(48_000.0);
+    scope.history.push(0, &[f32::NAN; 1000]);
+    scope.update(240, Trigger::Auto, Slope::Rising);
+    assert!(!scope.triggered);
+    let trace = scope.canvas_trace(true);
+    assert!(trace.points.is_empty());
+    assert_eq!(trace.level, 0.0);
+    scope.trace = vec![f32::NAN; loom_canvas::MAX_TRACE_POINTS * 2];
+    assert!(scope.canvas_trace(true).points.is_empty(), "reduced too");
+}
+
+/// An infinity is pinned to the frame's edge, as any value past the range
+/// is, and the level is full. It pushes the range to its largest step.
+#[test]
+fn an_infinity_is_drawn_at_the_edge() {
+    let mut samples = sine(1000.0, 48_000.0, 4800, 0.0);
+    samples[4700] = f32::INFINITY;
+    samples[4750] = f32::NEG_INFINITY;
+    let mut scope = ScopeTrace::new(48_000.0);
+    scope.history.push(0, &samples);
+    scope.update(240, Trigger::Auto, Slope::Rising);
+    assert!(!scope.triggered, "an infinity leaves Auto no level");
+    assert_eq!(scope.range, 10.0);
+    let trace = scope.canvas_trace(true);
+    assert!(all_finite(&trace));
+    assert!(trace.points.iter().any(|p| p[1] == 1.0));
+    assert!(trace.points.iter().any(|p| p[1] == -1.0));
+    assert_eq!(scope.canvas_trace(false).level, 1.0);
+}
+
+/// A fixed level with an infinity just before the crossing, on the side the
+/// edge starts from: nothing arms, so the trace runs free with an offset of
+/// 0, and every point is finite.
+#[test]
+fn an_infinity_before_a_fixed_level_runs_free_with_finite_points() {
+    let mut samples = sine(1000.0, 48_000.0, 4800, 0.0);
+    // The last rising crossing of 0.5 with a full window after it.
+    let crossing = (1..=4800 - 241)
+        .rev()
+        .find(|&i| samples[i - 1] < 0.5 && samples[i] >= 0.5)
+        .unwrap();
+    samples[crossing - 1] = f32::NEG_INFINITY;
+    let mut scope = ScopeTrace::new(48_000.0);
+    scope.history.push(0, &samples);
+    scope.update(240, Trigger::Level(0.5), Slope::Rising);
+    assert!(!scope.triggered);
+    assert_eq!(scope.offset, 0.0);
+    assert!(all_finite(&scope.canvas_trace(true)));
+}
+
+/// A fixed level with an infinity on the side the edge rises toward still
+/// triggers, here on the very sample after the crossing, and every point is
+/// finite.
+#[test]
+fn an_infinity_past_a_fixed_level_still_triggers() {
+    let mut samples = sine(1000.0, 48_000.0, 4800, 0.0);
+    let crossing = (1..=4800 - 241)
+        .rev()
+        .find(|&i| samples[i - 1] < 0.5 && samples[i] >= 0.5)
+        .unwrap();
+    samples[crossing] = f32::INFINITY;
+    let mut scope = ScopeTrace::new(48_000.0);
+    scope.history.push(0, &samples);
+    scope.update(240, Trigger::Level(0.5), Slope::Rising);
+    assert!(scope.triggered);
+    assert_eq!(scope.offset, 0.0, "the crossing is at the finite sample");
+    let trace = scope.canvas_trace(true);
+    assert!(all_finite(&trace));
+    assert!(trace.points.iter().any(|p| p[1] == 1.0));
 }

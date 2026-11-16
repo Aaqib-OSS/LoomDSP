@@ -362,7 +362,10 @@ impl Trigger {
 /// once per frame with the window to show and the trigger.
 pub struct ScopeTrace {
     history: History,
-    /// Samples to draw: one window plus one sample.
+    /// Samples to draw. A triggered trace has one window plus two samples,
+    /// from the sample before the trigger, so after the shift by `offset`
+    /// its line reaches past both edges of the frame. A free-running trace
+    /// has one window plus one sample, which spans the frame exactly.
     pub trace: Vec<f32>,
     /// How far the trigger lies past `trace[0]`, as a fraction of a sample.
     /// Shift the drawing left by this much, so the wave stays still even when
@@ -411,7 +414,7 @@ impl ScopeTrace {
                 let start = position.floor() as usize;
                 self.offset = position - start as f32;
                 self.trace
-                    .extend_from_slice(&samples[start..(start + window + 1).min(samples.len())]);
+                    .extend_from_slice(&samples[start..(start + window + 2).min(samples.len())]);
                 self.triggered = true;
             }
             None => {
@@ -435,7 +438,16 @@ impl ScopeTrace {
     ///
     /// More than [`loom_canvas::MAX_TRACE_POINTS`] samples are reduced by
     /// groups, keeping the lowest and highest sample of each in time order,
-    /// so a one-sample trigger always shows (ADR-0007).
+    /// so a one-sample trigger always shows (ADR-0007). The first and last
+    /// samples are kept too, with room left for them, so the reduced line
+    /// still reaches past both edges of the frame: a group's lowest and
+    /// highest can both lie inside it, as in a constant last group.
+    ///
+    /// Every point has a finite x and y (`docs/design/panels.md`, Drawing
+    /// the scope trace, Values that are not finite). A NaN sample has no
+    /// value, so it adds no point, and the line joins the samples on each
+    /// side. A group of only NaN adds none. An infinite sample is pinned to
+    /// the frame's edge by the clamp, as any value past the range is.
     pub fn canvas_trace(&self, full: bool) -> loom_canvas::Trace {
         let peak = self.trace.iter().fold(0.0f32, |m, x| m.max(x.abs()));
         let level = (normalise(peak) * 255.0).round() / 255.0;
@@ -451,26 +463,44 @@ impl ScopeTrace {
         };
         let n = self.trace.len();
         let max = loom_canvas::MAX_TRACE_POINTS;
+        let has_value = |&i: &usize| !self.trace[i].is_nan();
         let points = if n <= max {
-            (0..n).map(point).collect()
+            (0..n).filter(has_value).map(point).collect()
         } else {
-            let group = n.div_ceil(max / 2);
-            let mut points = Vec::with_capacity(max);
+            // Two points a group, and two left for the first and last
+            // samples, so the total stays within `max`.
+            let group = n.div_ceil((max - 2) / 2);
+            let mut kept: Vec<usize> = Vec::with_capacity(max);
+            // Keeps sample `i` unless it is already kept, so x keeps
+            // rising.
+            let mut keep = |i: usize| {
+                if kept.last().is_none_or(|&last| i > last) {
+                    kept.push(i);
+                }
+            };
+            // The first and last samples that have a value: a NaN adds no
+            // point.
+            if let Some(first) = (0..n).find(has_value) {
+                keep(first);
+            }
             for start in (0..n).step_by(group) {
                 let end = (start + group).min(n);
-                let (low, high) = (start..end).fold((start, start), |(lo, hi), i| {
+                let mut values = (start..end).filter(has_value);
+                let Some(first) = values.next() else { continue };
+                let (low, high) = values.fold((first, first), |(lo, hi), i| {
                     let v = self.trace[i];
                     (
                         if v < self.trace[lo] { i } else { lo },
                         if v > self.trace[hi] { i } else { hi },
                     )
                 });
-                points.push(point(low.min(high)));
-                if low != high {
-                    points.push(point(low.max(high)));
-                }
+                keep(low.min(high));
+                keep(low.max(high));
             }
-            points
+            if let Some(last) = (0..n).rev().find(has_value) {
+                keep(last);
+            }
+            kept.into_iter().map(point).collect()
         };
         loom_canvas::Trace {
             points,
@@ -500,8 +530,9 @@ fn decay(level: f32, target: f32, dt: f32) -> f32 {
     if next < 0.001 { 0.0 } else { next }
 }
 
-/// The latest edge of `slope` through the trigger level that still has a
-/// full window after it, as a sample position with a fraction.
+/// The latest edge of `slope` through the trigger level that still has
+/// `window + 2` samples from the sample before it, as a sample position
+/// with a fraction.
 ///
 /// With [`Trigger::Auto`] the level is halfway between the lowest and
 /// highest sample in the history, so signals with an offset (envelopes,
@@ -510,11 +541,19 @@ fn decay(level: f32, target: f32, dt: f32) -> f32 {
 /// history), so noise on a slow edge cannot trigger twice. Returns `None` for
 /// a flat signal or when no edge is found.
 ///
+/// A NaN never makes a crossing, since a comparison with it is false. A
+/// crossing whose fraction is not finite, which an infinity next to it can
+/// give, counts as no trigger, so the trace runs free and no point gets a NaN
+/// x (`docs/design/panels.md`, Drawing the scope trace, Values that are not
+/// finite).
+///
 /// A falling edge is a rising edge of the signal turned upside down, so both
 /// slopes share one search.
 fn find_trigger(samples: &[f32], window: usize, trigger: Trigger, slope: Slope) -> Option<f32> {
     let n = samples.len();
-    let last_start = n.checked_sub(window + 1)?;
+    // A start that leaves `window + 2` samples, so the line still reaches
+    // the right edge after the shift by the trigger's fraction.
+    let last_start = n.checked_sub(window + 2)?;
     let sign = match slope {
         Slope::Rising => 1.0,
         Slope::Falling => -1.0,
@@ -547,7 +586,7 @@ fn find_trigger(samples: &[f32], window: usize, trigger: Trigger, slope: Slope) 
         if let Some(found) = candidate {
             if now < arm {
                 let fraction = (level - at(found - 1)) / (at(found) - at(found - 1));
-                return Some((found - 1) as f32 + fraction);
+                return fraction.is_finite().then_some((found - 1) as f32 + fraction);
             }
             if now >= level {
                 candidate = None;
@@ -576,5 +615,7 @@ fn pick_range(current: f32, peak: f32) -> f32 {
     }
 }
 
+#[cfg(test)]
+mod app_tests;
 #[cfg(test)]
 mod tests;

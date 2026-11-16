@@ -6,11 +6,11 @@
 //! Every message to the app redraws the window, so draining telemetry on a
 //! UI timer would draw frames even when every meter is silent.
 
-use crate::clip::{PeakNews, Peaks};
+use crate::clip::{MeterWidget, PeakNews, Peaks};
 use crate::history::LevelHistory;
 use crate::live::{Level, Levels, ScopeTrace, Slope, Trigger};
 use crate::spectrum::SpectrumAnalyser;
-use crate::watcher::Outlet;
+use crate::watcher::{Outlet, Watched};
 use crate::xy::XyTrace;
 use loom_core::{MeterReading, PairChunk, ProbeId, ScopeChunk, Telemetry};
 use std::collections::{HashMap, HashSet};
@@ -59,9 +59,11 @@ pub struct WatchList {
     pub spectra: HashMap<ProbeId, SpectrumWant>,
     /// Paired probes whose XY scope is drawn, with how each draws.
     pub xy: HashMap<ProbeId, XyWant>,
-    /// Counts the UI's resets of clip lights and peak holds, by meter probe, so
-    /// the thread reports that probe's peaks again from there.
-    pub peak_resets: HashMap<ProbeId, u64>,
+    /// Each meter on screen, by module and widget, with the probe on its
+    /// output and its own count of the UI's resets of its clip light and
+    /// peak hold, so the thread reports that meter's peaks again from there.
+    /// Two meters on one output share the probe and keep their own counts.
+    pub peak_resets: HashMap<MeterWidget, (ProbeId, u64)>,
     /// True when scopes draw full traces (close zoom), false for a flat
     /// line at their level (middle zoom).
     pub full_traces: bool,
@@ -76,6 +78,43 @@ pub struct ScopeWant {
     pub trigger: Trigger,
     /// The edge that starts it.
     pub slope: Slope,
+    /// The scope's size as drawn, in physical pixels, so a trace is sent
+    /// only when its line moves by more than half a pixel
+    /// (`docs/design/panels.md`, Drawing the scope trace, The drawn size).
+    /// `None` until the app knows it: then any change is sent. Two scopes
+    /// on one probe share one want, with each side the larger of the two.
+    pub drawn: Option<DrawnSize>,
+}
+
+/// A display's size on screen in physical pixels: whole pixels, each side
+/// at least 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrawnSize {
+    /// Pixels across.
+    pub width: u32,
+    /// Pixels down.
+    pub height: u32,
+}
+
+impl DrawnSize {
+    /// A size from a width and height in physical pixels, each rounded to a
+    /// whole pixel and at least 1. Rounding keeps a small zoom step from
+    /// changing the watch list when no side moved by a pixel.
+    pub fn new(width: f32, height: f32) -> Self {
+        let side = |x: f32| if x.is_finite() { x.round().max(1.0) as u32 } else { 1 };
+        Self {
+            width: side(width),
+            height: side(height),
+        }
+    }
+
+    /// Each side the larger of the two, for two scopes on one probe.
+    pub fn max(self, other: Self) -> Self {
+        Self {
+            width: self.width.max(other.width),
+            height: self.height.max(other.height),
+        }
+    }
 }
 
 /// What one spectrum on screen draws.
@@ -103,8 +142,9 @@ pub struct XyWant {
 pub struct Update {
     /// Meter levels that changed by at least one of 256 steps.
     pub levels: Vec<(ProbeId, Level)>,
-    /// Scope traces that changed: only what is drawn, so a still or silent
-    /// signal sends none.
+    /// Scope traces whose line moved by more than half a pixel as drawn, or
+    /// whose level changed at the middle zoom ([`scope_moved`]): a still or
+    /// silent signal, or a steady smooth wave, sends none.
     pub traces: Vec<(ProbeId, loom_canvas::Trace)>,
     /// Level histories that moved: a still or silent one sends none.
     pub histories: Vec<(ProbeId, loom_canvas::Trace)>,
@@ -113,8 +153,8 @@ pub struct Update {
     pub spectra: Vec<(ProbeId, loom_canvas::Trace)>,
     /// XY traces that changed: a still or silent one sends none.
     pub xy: Vec<(ProbeId, loom_canvas::Trace)>,
-    /// Raw peaks that could change a clip light or a peak hold.
-    pub peaks: Vec<(ProbeId, PeakNews)>,
+    /// Raw peaks that could change a clip light or a peak hold, by meter.
+    pub peaks: Vec<(MeterWidget, PeakNews)>,
     /// Activity probes whose state changed: true for carrying.
     pub activity: Vec<(ProbeId, bool)>,
 }
@@ -178,7 +218,7 @@ impl Watcher {
         now: Instant,
     ) -> Update {
         self.levels.update(readings, now);
-        self.peaks.note(&watch.peak_resets, &watch.meters, readings);
+        self.peaks.note(&watch.peak_resets, readings);
         let current: Vec<(ProbeId, Level)> = self
             .levels
             .all()
@@ -221,7 +261,7 @@ impl Watcher {
             };
             scope.update(want.window, want.trigger, want.slope);
             let trace = scope.canvas_trace(watch.full_traces);
-            if self.shown_traces.get(probe) != Some(&trace) {
+            if scope_moved(self.shown_traces.get(probe), &trace, want.drawn) {
                 traces.push((*probe, trace));
             }
         }
@@ -374,7 +414,9 @@ impl Watcher {
 #[derive(Clone)]
 pub struct Monitor {
     telemetry: Arc<Mutex<Option<Telemetry>>>,
-    watch: Arc<Mutex<WatchList>>,
+    /// What the UI draws, which the thread waits on, so a change drains
+    /// early.
+    watch: Watched<WatchList>,
     sample_rate: f32,
     generation: u64,
 }
@@ -386,20 +428,26 @@ impl Monitor {
     pub fn new(telemetry: Telemetry, sample_rate: f32, generation: u64) -> Self {
         Self {
             telemetry: Arc::new(Mutex::new(Some(telemetry))),
-            watch: Arc::new(Mutex::new(WatchList::default())),
+            watch: Watched::default(),
             sample_rate,
             generation,
         }
     }
 
-    /// Tells the thread what the UI draws now.
+    /// Tells the thread what the UI draws now. A list that differs wakes it,
+    /// so it drains at once; an equal one changes nothing.
     pub fn watch(&self, list: WatchList) {
-        *self.watch.lock().unwrap_or_else(PoisonError::into_inner) = list;
+        self.watch.set(list);
     }
 
     /// What the UI draws, as last told.
     pub fn watched(&self) -> WatchList {
-        self.watch.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        self.watch.get().0
+    }
+
+    /// The watch list the thread waits on.
+    pub(crate) fn list(&self) -> &Watched<WatchList> {
+        &self.watch
     }
 
     /// The engine's sample rate.
@@ -436,7 +484,7 @@ impl Monitor {
 #[cfg(test)]
 impl Monitor {
     /// Reads the meter queues once and turns the readings into levels, as
-    /// `lights::Watch::read` reads the lights. For tests, which have no
+    /// `lights::OnScreen::read` reads the lights. For tests, which have no
     /// telemetry thread. One update, so the levels do not fall.
     pub fn read(&self) -> Vec<(ProbeId, Level)> {
         let mut levels = Levels::default();
@@ -465,6 +513,180 @@ pub fn moved(shown: Option<&loom_canvas::Trace>, trace: &loom_canvas::Trace, tol
     apart(&shown.points, &trace.points) || apart(&shown.second, &trace.second)
 }
 
+/// How far a scope's line must move before the UI hears of it: half a
+/// pixel as drawn, which nobody can see.
+const SCOPE_TOLERANCE: f32 = 0.5;
+
+/// The most segments of the other line tried for one point of a scope
+/// trace, the window included. A point that reaches it counts as moved, so
+/// the check never stalls the telemetry thread, which also carries the meters
+/// and the clip news (`docs/design/panels.md`, Drawing the scope trace,
+/// Bounded cost).
+pub const SCOPE_SEGMENT_CAP: usize = 64;
+
+/// True when a scope's `trace` differs on screen from what the UI has
+/// (`docs/design/panels.md`, Drawing the scope trace, What counts as moved).
+///
+/// Nothing shown yet counts as moved. With no drawn size known, any change
+/// counts. When both traces have no points (the middle zoom, where only the
+/// level is drawn), any change of the level's 256 steps counts. When one has
+/// points and the other has none, it moved. Otherwise only the points are
+/// compared, so a level change alone sends nothing: a point of either trace
+/// inside the frame (x from 0 to 1), or a point where its line crosses the
+/// frame's left or right edge, that lies more than half a pixel, at the drawn
+/// size, from the other trace's whole line has moved. Points outside the
+/// frame still shape the line. A scope trace has no `second` line.
+pub fn scope_moved(shown: Option<&loom_canvas::Trace>, trace: &loom_canvas::Trace, drawn: Option<DrawnSize>) -> bool {
+    let Some(shown) = shown else {
+        return true;
+    };
+    let Some(size) = drawn else {
+        return shown != trace;
+    };
+    match (shown.points.is_empty(), trace.points.is_empty()) {
+        (true, true) => shown.level != trace.level,
+        (false, false) => line_check(&shown.points, &trace.points, size).moved,
+        _ => true,
+    }
+}
+
+/// What a check of two scope lines found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineCheck {
+    /// True when a point lies more than half a pixel from the other line,
+    /// or reached [`SCOPE_SEGMENT_CAP`].
+    pub moved: bool,
+    /// The segment tests it took. The check stops at the first point that
+    /// moved.
+    pub tests: usize,
+}
+
+/// Checks two scope lines against each other both ways, at `size`: first
+/// the points of `a` against the line of `b`, then the other way round. Both
+/// must run left to right in x and have only finite points, as
+/// [`ScopeTrace::canvas_trace`] gives them.
+pub fn line_check(a: &[[f32; 2]], b: &[[f32; 2]], size: DrawnSize) -> LineCheck {
+    // A NaN would never lie near any line, so every read would count as
+    // moved. `ScopeTrace::canvas_trace` gives only finite points.
+    debug_assert!(
+        a.iter().chain(b).flatten().all(|v| v.is_finite()),
+        "a scope trace has only finite points"
+    );
+    let mut tests = 0;
+    let moved = points_off_line(a, b, size, &mut tests) || points_off_line(b, a, size, &mut tests);
+    LineCheck { moved, tests }
+}
+
+/// True when a point of `points` inside the frame, or a point where their
+/// line crosses x = 0 or x = 1, lies more than [`SCOPE_TOLERANCE`] pixels
+/// from the line through `line`, or reaches the cap. Adds each segment test
+/// to `tests`.
+///
+/// The crossings matter because a segment from a point inside to a point
+/// outside is drawn up to the edge: when only the outside point moves, the
+/// end of the line at the edge moves, and no point inside does.
+///
+/// For each point the search keeps a window on the line: the segments whose
+/// x comes within the tolerance of the point's. Both lines run left to right,
+/// so the window only moves forward, and the whole check is close to linear.
+/// Inside the window it tries the segment under the point first, then its
+/// neighbours outward, since on a line that held still the nearest segment is
+/// usually there.
+fn points_off_line(points: &[[f32; 2]], line: &[[f32; 2]], size: DrawnSize, tests: &mut usize) -> bool {
+    // Left to right in x: the crossing at the left edge, the points inside,
+    // then the crossing at the right edge.
+    let framed = || {
+        crossing(points, 0.0)
+            .into_iter()
+            .chain(points.iter().copied().filter(|p| (0.0..=1.0).contains(&p[0])))
+            .chain(crossing(points, 1.0))
+    };
+    if line.is_empty() {
+        return framed().next().is_some();
+    }
+    let (width, height) = (size.width as f32, size.height as f32);
+    // x from 0 to 1 across the width, y from -1 to 1 up the height.
+    let pixels = |p: [f32; 2]| [p[0] * width, p[1] * height * 0.5];
+    let last = line.len() - 1;
+    // Segment j joins point j and point j + 1. A line of one point is one
+    // segment of no length.
+    let segments = last.max(1);
+    let segment = |j: usize| (pixels(line[j]), pixels(line[(j + 1).min(last)]));
+    // The first segment whose right end reaches x - tolerance, the first
+    // whose right end reaches x, and the first whose left end lies past
+    // x + tolerance.
+    let (mut low, mut under, mut high) = (0, 0, 0);
+    for point in framed() {
+        let p = pixels(point);
+        while low < segments && segment(low).1[0] < p[0] - SCOPE_TOLERANCE {
+            low += 1;
+        }
+        under = under.max(low);
+        while under < segments && segment(under).1[0] < p[0] {
+            under += 1;
+        }
+        high = high.max(under);
+        while high < segments && segment(high).0[0] <= p[0] + SCOPE_TOLERANCE {
+            high += 1;
+        }
+        if low >= high {
+            // No part of the line comes near this point's x.
+            return true;
+        }
+        let start = under.clamp(low, high - 1);
+        let mut tried = 0;
+        let mut near = false;
+        'search: for step in 0.. {
+            let above = start + step;
+            let below = start.checked_sub(step).filter(|&j| step > 0 && j >= low);
+            if above >= high && below.is_none() {
+                break;
+            }
+            for j in [Some(above).filter(|&j| j < high), below].into_iter().flatten() {
+                if tried == SCOPE_SEGMENT_CAP {
+                    break 'search;
+                }
+                tried += 1;
+                *tests += 1;
+                let (from, to) = segment(j);
+                if distance_to_segment(p, from, to) <= SCOPE_TOLERANCE {
+                    near = true;
+                    break 'search;
+                }
+            }
+        }
+        if !near {
+            return true;
+        }
+    }
+    false
+}
+
+/// The point where the line through `points`, which runs left to right in
+/// x, crosses the vertical line at `edge`, found by linear interpolation
+/// along the segment that spans it. `None` when no segment has one end on
+/// each side: the line does not reach past the edge, or a point lies on it
+/// and is tested as a point inside the frame.
+fn crossing(points: &[[f32; 2]], edge: f32) -> Option<[f32; 2]> {
+    let pair = points.windows(2).find(|w| w[0][0] < edge && w[1][0] > edge)?;
+    let (a, b) = (pair[0], pair[1]);
+    let t = (edge - a[0]) / (b[0] - a[0]);
+    Some([edge, a[1] + t * (b[1] - a[1])])
+}
+
+/// The distance in pixels from `p` to the segment from `a` to `b`.
+fn distance_to_segment(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let length = dx * dx + dy * dy;
+    let t = if length > 0.0 {
+        (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / length).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (x, y) = (a[0] + t * dx - p[0], a[1] + t * dy - p[1]);
+    (x * x + y * y).sqrt()
+}
+
 /// The quantised left and optional right meter levels.
 pub type MeterSteps = (u8, u8, Option<(u8, u8)>);
 
@@ -488,40 +710,48 @@ pub fn changed(shown: &HashMap<ProbeId, MeterSteps>, levels: &[(ProbeId, Level)]
 }
 
 /// Drains the queues every [`INTERVAL`], or [`SCOPE_INTERVAL`] while a
-/// scope or a spectrum is on screen, and yields what changed on screen. The thread stops
-/// when the app closes.
+/// scope, a spectrum, or an XY scope is on screen, and yields what changed on
+/// screen. It waits on the watch list for up to that interval, so a change
+/// to what the UI draws drains at once. Each turn goes: wait, check closed,
+/// read the list, drain, compare, and send. The thread stops when the
+/// handle drops.
 pub fn run(monitor: &Monitor, tx: Outlet<Update>) {
     let telemetry = monitor.telemetry.lock().ok().and_then(|mut t| t.take());
-    if let Some(mut telemetry) = telemetry {
-        {
-            let mut watcher = Watcher::default();
-            while !tx.is_closed() {
-                let watch = monitor.watched();
-                let readings: Vec<MeterReading> = telemetry.meters().collect();
-                let mut update = watcher.take(
-                    &watch,
-                    &readings,
-                    telemetry.scope(),
-                    monitor.sample_rate,
-                    Instant::now(),
-                );
-                update.xy = watcher.take_pairs(&watch, telemetry.pairs(), monitor.sample_rate);
-                if !update.is_empty() {
-                    match tx.try_send(update.clone()) {
-                        Ok(()) => watcher.sent(&update),
-                        // The UI has not taken the last one yet: try again
-                        // next time, with fresh values.
-                        Err(e) if e.is_full() => {}
-                        Err(_) => break,
-                    }
-                }
-                std::thread::sleep(
-                    if watch.scopes.is_empty() && watch.spectra.is_empty() && watch.xy.is_empty() {
-                        INTERVAL
-                    } else {
-                        SCOPE_INTERVAL
-                    },
-                );
+    let Some(mut telemetry) = telemetry else {
+        return;
+    };
+    let mut watcher = Watcher::default();
+    // Nothing seen yet, so the first wait returns at once.
+    let mut seen = None;
+    let mut interval = INTERVAL;
+    loop {
+        tx.wait(&monitor.watch, seen, interval);
+        if tx.is_closed() {
+            break;
+        }
+        let (watch, version) = monitor.watch.get();
+        seen = Some(version);
+        interval = if watch.scopes.is_empty() && watch.spectra.is_empty() && watch.xy.is_empty() {
+            INTERVAL
+        } else {
+            SCOPE_INTERVAL
+        };
+        let readings: Vec<MeterReading> = telemetry.meters().collect();
+        let mut update = watcher.take(
+            &watch,
+            &readings,
+            telemetry.scope(),
+            monitor.sample_rate,
+            Instant::now(),
+        );
+        update.xy = watcher.take_pairs(&watch, telemetry.pairs(), monitor.sample_rate);
+        if !update.is_empty() {
+            match tx.try_send(update.clone()) {
+                Ok(()) => watcher.sent(&update),
+                // The UI has not taken the last one yet: try again next
+                // time, with fresh values.
+                Err(e) if e.is_full() => {}
+                Err(_) => break,
             }
         }
     }

@@ -196,6 +196,11 @@ impl<'a> A11yNode<'a> {
         self.raw().description()
     }
 
+    /// Where it is in the window, in physical pixels, if it has a place.
+    pub fn bounds(&self) -> Option<accesskit::Rect> {
+        self.raw().bounds()
+    }
+
     /// Its checked state, for a radio option, a toggle, or a check box.
     pub fn toggled(&self) -> Option<accesskit::Toggled> {
         self.raw().toggled()

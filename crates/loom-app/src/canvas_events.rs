@@ -295,7 +295,7 @@ impl App {
             CanvasEvent::ClearClip { module, widget } => self.reset_clip((module, widget), false),
             CanvasEvent::ResetMeter { module, widget } => self.reset_clip((module, widget), true),
             CanvasEvent::VisibleDisplays(ids) => {
-                self.session.visible_displays = ids;
+                self.set_visible_displays(ids);
                 self.sync_probes();
                 self.refresh_values();
             }
@@ -313,6 +313,9 @@ impl App {
             // Each level keeps its camera for the session.
             CanvasEvent::Camera(camera) => {
                 self.session.cameras.insert(self.session.level.clone(), camera);
+                // A scope's drawn size follows the zoom. The list is updated
+                // in place, so no thread restarts.
+                self.publish_watch();
             }
         }
     }

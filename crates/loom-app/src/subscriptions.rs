@@ -49,11 +49,11 @@ impl App {
             .map(|(listening, heard)| heard.message(listening))
     }
 
-    /// The lights on screen and where their values live, or `None` when
-    /// there are none.
-    pub(crate) fn watched_lights(&self) -> Option<lights::Watch> {
+    /// The lights on screen and where their values live, with the reader of
+    /// this engine's table, or `None` when there are none.
+    pub(crate) fn watched_lights(&self) -> Option<lights::OnScreen> {
         let graph = self.session.controller.graph();
-        let (lights, (ranges, readouts)): (Vec<_>, (Vec<_>, Vec<_>)) = self
+        let lights: Vec<lights::Entry> = self
             .session
             .visible_displays
             .iter()
@@ -66,16 +66,75 @@ impl App {
             })
             .filter_map(|(light, display, range, readout)| {
                 let source = self.session.controller.display_source(ModuleId(light.0), display)?;
-                Some(((light, source), (range, readout)))
+                Some(lights::Entry {
+                    light,
+                    source,
+                    range,
+                    readout,
+                })
             })
-            .unzip();
-        (!lights.is_empty()).then(|| lights::Watch {
+            .collect();
+        (!lights.is_empty()).then(|| lights::OnScreen {
             reader: self.session.controller.display_reader(),
-            readouts,
             lights,
-            ranges,
-            generation: self.generation,
         })
+    }
+
+    /// The trigger lights on the watched list now.
+    fn watched_triggers(&self) -> std::collections::BTreeSet<lights::Light> {
+        self.watched_lights()
+            .into_iter()
+            .flat_map(|on| on.lights)
+            .filter(|entry| entry.source.kind() == loom_core::DisplayKind::Trigger)
+            .map(|entry| entry.light)
+            .collect()
+    }
+
+    /// Whether a light shows a trigger display value, by its module's
+    /// descriptor. A light that no longer exists is not one.
+    fn is_trigger_light(&self, (id, widget): lights::Light) -> bool {
+        let Some(node) = self.session.controller.graph().node(ModuleId(id)) else {
+            return false;
+        };
+        let d = node.descriptor;
+        d.panel
+            .widgets
+            .get(widget)
+            .filter(|w| !w.is_control())
+            .and_then(|w| d.display_index(w.bind()))
+            .and_then(|index| d.displays.get(index))
+            .is_some_and(|spec| spec.kind == loom_core::DisplayKind::Trigger)
+    }
+
+    /// Takes the light readings the watcher thread sent. A reading for a
+    /// trigger light off the watched list is ignored: it was sent before the
+    /// light left the screen, and would light it again after
+    /// [`App::set_visible_displays`] set it dark. A level light takes every
+    /// reading, as its last value is the best guess until the next one
+    /// (`docs/design/panels.md`, Redraw).
+    pub(crate) fn take_lights(&mut self, readings: Vec<(lights::Light, f32)>) {
+        let mut watched = None;
+        for (light, value) in readings {
+            if self.is_trigger_light(light) && !watched.get_or_insert_with(|| self.watched_triggers()).contains(&light)
+            {
+                continue;
+            }
+            self.session.lights.insert(light, value);
+        }
+    }
+
+    /// Says which modules' displays are on screen, as the canvas reports. A
+    /// trigger light that leaves the screen is set dark, and so is one new
+    /// to the list, so it does not draw lit for a frame when it comes back,
+    /// before its first reading. A level light keeps its last value, the
+    /// best guess until then (`docs/design/panels.md`, Redraw).
+    pub(crate) fn set_visible_displays(&mut self, ids: Vec<u32>) {
+        let before = self.watched_triggers();
+        self.session.visible_displays = ids;
+        let after = self.watched_triggers();
+        for light in before.symmetric_difference(&after) {
+            self.session.lights.insert(*light, 0.0);
+        }
     }
 }
 
