@@ -732,9 +732,136 @@ fn cable_fades_never_allocate() {
     );
 }
 
+/// Assignment changes start setting blends on the audio thread with no
+/// allocation: a burst of depth, polarity, and on/off changes during a
+/// blend, during a swap's fade, and around a swap that brings back other
+/// settings, as undo does (live patching spec, rule 9, #762).
+#[test]
+fn assignment_changes_never_allocate() {
+    let mut parts = create_engine(loom_modules::registry(), EngineConfig::with_sample_rate(SAMPLE_RATE));
+    let c = &mut parts.controller;
+    let noise = c.add_module("loom.osc.noise").unwrap();
+    let svf = c.add_module("loom.filter.svf").unwrap();
+    let lfo = c.add_module("loom.mod.lfo").unwrap();
+    let other = c.add_module("loom.mod.lfo").unwrap();
+    let out = c.add_module("loom.io.audio-out").unwrap();
+    c.connect_named(noise, "out", svf, "in").unwrap();
+    c.connect_named(svf, "lowpass", out, "in").unwrap();
+    let first = c.add_assignment_named(lfo, "out", svf, "cutoff", 0.5).unwrap();
+    let second = c.add_assignment_named(other, "out", svf, "resonance", 0.3).unwrap();
+    c.commit().unwrap();
+    let mut left = [0.0; 256];
+    let mut right = [0.0; 256];
+    for _ in 0..3 {
+        assert_no_alloc(|| parts.engine.process(&mut left, &mut right));
+    }
+    let burst = |c: &mut loom_core::Controller| {
+        for step in 0..16 {
+            let depth = step as f32 / 16.0 - 0.5;
+            c.set_assignment_depth(first, depth).unwrap();
+            c.set_assignment_depth(second, -depth).unwrap();
+        }
+        c.set_assignment_polarity(first, Some(loom_core::Polarity::Unipolar))
+            .unwrap();
+        c.set_assignment_enabled(second, false).unwrap();
+        c.set_assignment_enabled(second, true).unwrap();
+    };
+    // During a blend: each burst lands 16 frames into the last one's blend.
+    for _ in 0..4 {
+        burst(&mut parts.controller);
+        assert_no_alloc(|| parts.engine.process(&mut left[..16], &mut right[..16]));
+    }
+    // During a swap's fade: a moved source fades, and the burst blends on
+    // top of it.
+    let to = parts.controller.output_ref(other, "out").unwrap();
+    let param = parts
+        .controller
+        .graph()
+        .node(svf)
+        .unwrap()
+        .descriptor
+        .param_index("cutoff")
+        .unwrap();
+    parts.controller.retarget_assignment(first, to, svf, param).unwrap();
+    parts.controller.commit().unwrap();
+    assert_no_alloc(|| parts.engine.process(&mut left[..16], &mut right[..16]));
+    burst(&mut parts.controller);
+    assert_no_alloc(|| parts.engine.process(&mut left, &mut right));
+    // A swap that brings back other settings, as undo does, in the same
+    // batch as a burst.
+    let mut assignment = *parts.controller.graph().assignment(second).unwrap();
+    parts.controller.remove_assignment(second).unwrap();
+    assignment.depth = 0.9;
+    parts.controller.restore_assignment(second, assignment).unwrap();
+    burst(&mut parts.controller);
+    parts.controller.commit().unwrap();
+    for _ in 0..3 {
+        assert_no_alloc(|| parts.engine.process(&mut left, &mut right));
+    }
+    parts.controller.collect_garbage();
+}
+
+/// Phase cable changes add no allocation on the audio thread (live
+/// patching spec, rule 9, #763): a phase plugged into a Phase Shift before
+/// a Sine, moved, and pulled, and the Sine's own phase cable plugged and
+/// pulled, each fading the filter and the assignment the Sine drives, one
+/// of them during another's fade.
+#[test]
+fn phase_cable_changes_never_allocate() {
+    let mut parts = create_engine(loom_modules::registry(), EngineConfig::with_sample_rate(SAMPLE_RATE));
+    let c = &mut parts.controller;
+    let first = c.add_module("loom.phase.generator").unwrap();
+    let other = c.add_module("loom.phase.generator").unwrap();
+    let shift = c.add_module("loom.phase.shift").unwrap();
+    let sine = c.add_module("loom.osc.sine").unwrap();
+    let svf = c.add_module("loom.filter.svf").unwrap();
+    let out = c.add_module("loom.io.audio-out").unwrap();
+    c.connect_named(shift, "phase", sine, "phase").unwrap();
+    c.connect_named(sine, "out", svf, "in").unwrap();
+    c.connect_named(svf, "lowpass", out, "in").unwrap();
+    c.add_assignment_named(sine, "out", svf, "cutoff", 0.3).unwrap();
+    let probe = c.output_ref(other, "phase").unwrap();
+    c.add_probe(probe, loom_core::ProbeKind::Meter).unwrap();
+    c.commit().unwrap();
+    let shift_in = c.input_ref(shift, "phase").unwrap();
+    let sine_in = c.input_ref(sine, "phase").unwrap();
+    let mut left = [0.0; 256];
+    let mut right = [0.0; 256];
+    for _ in 0..3 {
+        assert_no_alloc(|| parts.engine.process(&mut left, &mut right));
+    }
+    let edits: [(Option<loom_core::ModuleId>, InputRef); 5] = [
+        (Some(first), shift_in),
+        (Some(other), shift_in),
+        (None, shift_in),
+        (None, sine_in),
+        (Some(other), sine_in),
+    ];
+    for (from, to) in edits {
+        let c = &mut parts.controller;
+        match from {
+            Some(from) => {
+                c.connect(c.output_ref(from, "phase").unwrap(), to).unwrap();
+            }
+            None => {
+                c.disconnect(to).unwrap();
+            }
+        }
+        assert!(c.commit().unwrap().cable_fades > 0, "the Sine's readers fade");
+        // The next edit lands during this one's fade.
+        assert_no_alloc(|| parts.engine.process(&mut left[..16], &mut right[..16]));
+    }
+    for _ in 0..3 {
+        assert_no_alloc(|| parts.engine.process(&mut left, &mut right));
+    }
+    parts.controller.collect_garbage();
+}
+
 /// A swap inside a stack of four, with a spread on the slot's cutoff, adds
 /// each copy's part and fade on the control thread: the audio thread
-/// allocates nothing through the fade or the finish (ADR-0044).
+/// allocates nothing through the fade or the finish (ADR-0044), nor
+/// through Remove part and a swap back into the empty slot, which fade in
+/// every copy too (ADR-0046).
 #[test]
 fn a_slot_swap_inside_a_stack_never_allocates() {
     use loom_patch::{FlatIds, Hierarchy, Layout, ModulePath, Patch};
@@ -786,6 +913,34 @@ fn a_slot_swap_inside_a_stack_never_allocates() {
     hierarchy
         .swap_to_module(&mut parts.controller, &layout, slot, "loom.filter.ladder@1")
         .unwrap();
+    hierarchy.sync(&mut parts.controller).unwrap();
+    parts.controller.commit().unwrap();
+    for _ in 0..4 {
+        assert_no_alloc(|| parts.engine.process(&mut left, &mut right));
+    }
+    hierarchy.finish_all_fades(&mut parts.controller);
+    hierarchy.sync(&mut parts.controller).unwrap();
+    parts.controller.commit().unwrap();
+    for _ in 0..2 {
+        assert_no_alloc(|| parts.engine.process(&mut left, &mut right));
+    }
+    // Out of the slot and back in, each fading in every copy from or to
+    // its own thru signal (ADR-0046).
+    let emptied = hierarchy.swap_to_empty(&mut parts.controller, &layout, slot).unwrap();
+    assert!(emptied.gone.is_empty(), "every copy fades out");
+    hierarchy.sync(&mut parts.controller).unwrap();
+    parts.controller.commit().unwrap();
+    for _ in 0..4 {
+        assert_no_alloc(|| parts.engine.process(&mut left, &mut right));
+    }
+    hierarchy.finish_all_fades(&mut parts.controller);
+    hierarchy.sync(&mut parts.controller).unwrap();
+    parts.controller.commit().unwrap();
+    assert_no_alloc(|| parts.engine.process(&mut left, &mut right));
+    hierarchy
+        .swap_to_module(&mut parts.controller, &layout, slot, "loom.filter.svf@1")
+        .unwrap();
+    assert_eq!(hierarchy.fading_slots().len(), 1, "every copy fades in");
     hierarchy.sync(&mut parts.controller).unwrap();
     parts.controller.commit().unwrap();
     for _ in 0..4 {
