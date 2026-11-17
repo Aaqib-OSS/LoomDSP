@@ -96,11 +96,14 @@ impl Window {
         &self.stops
     }
 
-    /// The focus stop a press at `point` focuses. The panels are tried as
-    /// [`Window::hit`] tries them. `None` when no panel takes the point;
-    /// `Some(None)` when one takes it and no stop is there.
-    pub(crate) fn focus_at(&self, point: Point) -> Option<Option<&UiId>> {
-        self.first_taker(point, |record, inside| record.layout.focus_at(inside))
+    /// The focus stop a press at `point` focuses, among the panels of the
+    /// layers `keep` allows, tried as [`Window::hit_in`] tries them. `None`
+    /// when no panel takes the point; `Some(None)` when one takes it and no
+    /// stop is there.
+    pub(crate) fn focus_at_in(&self, point: Point, keep: impl Fn(Layer) -> bool) -> Option<Option<&UiId>> {
+        self.first_taker(point, |record, inside| {
+            keep(record.layer).then(|| record.layout.focus_at(inside)).flatten()
+        })
     }
 
     /// The panel that holds the element with UI ID `id`: the one whose key
@@ -110,6 +113,11 @@ impl Window {
             .keys()
             .filter(|key| id == *key || id.is_under(key))
             .max_by_key(|key| key.keys().len())
+    }
+
+    /// The layer of the panel that holds the element with UI ID `id`.
+    pub(crate) fn layer_of(&self, id: &UiId) -> Option<Layer> {
+        self.panel_of(id).map(|panel| self.records[panel].layer)
     }
 
     /// The first focus stop of the panel keyed `panel`, or of the panels in

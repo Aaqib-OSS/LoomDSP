@@ -203,6 +203,11 @@ impl Window {
         let old_order = std::mem::take(&mut self.order);
         self.records
             .retain(|key, _| built.iter().any(|(kept, _, _)| kept == key));
+        // What was drawn last is read before the next layout (a pointer
+        // routed between a turn and its frame), so a removed panel leaves
+        // it now, not at that layout.
+        let records = &self.records;
+        self.drawn.retain(|key| records.contains_key(key));
         let mut dropped = 0;
         for (key, layer, element) in built {
             let record = self.records.entry(key.clone()).or_insert_with(|| Record {
@@ -486,6 +491,17 @@ impl Window {
     pub(crate) fn hit(&self, point: Point) -> Option<(Layer, Hit<'_>)> {
         self.first_taker(point, |record, inside| {
             record.layout.hit(inside).map(|hit| (record.layer, hit))
+        })
+    }
+
+    /// What is under `point` in the panels of the layers `keep` allows,
+    /// tried as [`Window::hit`] tries them. A panel in another layer is
+    /// passed over, as if it were not there.
+    pub(crate) fn hit_in(&self, point: Point, keep: impl Fn(Layer) -> bool) -> Option<(Layer, Hit<'_>)> {
+        self.first_taker(point, |record, inside| {
+            keep(record.layer)
+                .then(|| record.layout.hit(inside).map(|hit| (record.layer, hit)))
+                .flatten()
         })
     }
 
