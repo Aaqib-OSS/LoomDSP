@@ -26,6 +26,10 @@
 //!   type in its API. See `examples/layout.rs`. Panels compose through
 //!   slots ([`Element::slot`]): the runtime keeps each panel's layout, and
 //!   the driver calls [`Runtime::lay_out`] before it draws.
+//! - **Drawing panels** ([`Runtime::paint`]): each element's box and text,
+//!   in the look it sets, cut to its clips and its slot, which
+//!   hit-testing cuts the same way. A shell layer lays out and paints
+//!   through [`Panels`], lent with the app in [`shell::Parts`].
 //! - **Focus and the accessibility tree** ([`Element::focusable`],
 //!   [`Element::access`], [`access`]): a keyed element can be a focus stop
 //!   and say what it is to a screen reader. The runtime keeps the focus
@@ -54,6 +58,7 @@
 
 pub mod access;
 mod app;
+mod draw;
 mod driver;
 pub mod effect;
 mod element;
@@ -72,6 +77,7 @@ mod waker;
 mod window;
 
 pub use app::{App, Context, Deadline, WindowSpec};
+pub use draw::Panels;
 pub use driver::Driver;
 pub use effect::{Effect, Effects};
 pub use element::{Align, Element, Length, Padding};

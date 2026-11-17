@@ -286,6 +286,13 @@ impl<A: App, T: Target<A::Message>> Harness<A, T> {
         self.runtime.lay_out(text);
     }
 
+    /// The app, the target, and the panels, as a driver that draws holds
+    /// them ([`Runtime::parts`]): a layout through these settles the focus
+    /// as [`Harness::lay_out`] does, and owes the target any release.
+    pub fn parts(&mut self) -> (&A, &mut T, crate::Panels<'_>) {
+        self.runtime.parts()
+    }
+
     /// Focuses what a press at `point` reaches, as a router does when the
     /// runtime's layer takes the press ([`Runtime::focus_at`]).
     pub fn focus_at(&mut self, point: Point) -> Option<UiId> {

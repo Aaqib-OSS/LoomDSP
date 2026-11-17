@@ -7,6 +7,7 @@
 //! target; crossing from one toolkit's order to the other's is routing.
 
 use crate::view::Layer;
+use crate::window::Window;
 use accesskit::{Node, NodeId};
 use loom_ui_core::{Color, UiId};
 
@@ -52,6 +53,56 @@ pub struct AccessNodes {
     pub roots: Vec<(UiId, Layer, Vec<NodeId>)>,
     /// The node of the element with focus, when one of these has it.
     pub focus: Option<NodeId>,
+}
+
+/// Which of the runtime's own elements has keyboard focus, and what a
+/// layout still owes it. The runtime owns it, and lends it with the panels
+/// ([`Panels`](crate::Panels)), so a layout through a driver's parts
+/// settles the focus as [`Runtime::lay_out`](crate::Runtime::lay_out) does.
+#[derive(Debug, Default)]
+pub(crate) struct Focus {
+    /// The element with focus.
+    pub(crate) id: Option<UiId>,
+    /// The keyboard, or a focus effect, put it there, so a ring shows
+    /// (ui-layer.md, section 6, rule 3). A press does not.
+    pub(crate) ring: bool,
+    /// A focus effect named a UI ID that no laid-out stop has yet, such as
+    /// a field in a panel opened in the same turn. The next layout takes it
+    /// if a focus stop has it by then, and drops it otherwise; a focus that
+    /// moves first drops it too.
+    pub(crate) wanted: Option<UiId>,
+    /// A layout gave one of the runtime's elements the focus, so the
+    /// routing target must let go of its own (section 6, rule 1). A layout
+    /// through the driver's parts cannot reach the target, which the driver
+    /// holds then, so the runtime carries it out before it routes again.
+    pub(crate) release_owed: bool,
+}
+
+impl Focus {
+    /// After a layout: takes a focus that a focus effect asked for before
+    /// its element was laid out, and owes the target its release, or moves
+    /// a focus whose element is gone to the first stop of the panel that
+    /// held it, or to none when that panel is gone too or has no stop
+    /// (section 6, rule 4).
+    pub(crate) fn settle(&mut self, window: &Window) {
+        if let Some(wanted) = self.wanted.take()
+            && window.stops().contains(&wanted)
+        {
+            self.release_owed = true;
+            self.id = Some(wanted);
+            self.ring = true;
+            return;
+        }
+        let Some(focus) = &self.id else {
+            return;
+        };
+        if !window.stops().contains(focus) {
+            self.id = window
+                .panel_of(focus)
+                .cloned()
+                .and_then(|panel| window.first_stop_in(&panel));
+        }
+    }
 }
 
 #[cfg(test)]

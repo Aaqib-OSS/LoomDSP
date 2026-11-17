@@ -403,10 +403,14 @@ fn a_focus_effect_on_a_stop_focuses_it() {
 struct Toolkit {
     focused: Option<UiId>,
     told: Vec<FocusTarget>,
+    /// The focus it had when each input event reached it.
+    heard_with: Vec<Option<UiId>>,
 }
 
 impl Target<Message> for Toolkit {
-    fn input(&mut self, _event: &Event, _pointer: Option<Point>, _now: Instant, _out: &mut Vec<Message>) {}
+    fn input(&mut self, _event: &Event, _pointer: Option<Point>, _now: Instant, _out: &mut Vec<Message>) {
+        self.heard_with.push(self.focused.clone());
+    }
 
     fn focus(&mut self, target: &FocusTarget, _select: Selection) {
         self.focused = match target {
@@ -633,4 +637,63 @@ fn a_context_outside_a_runtime_has_no_nodes() {
     let cx = Context::new(Instant::now(), &waker, None, WindowState::new(Size::new(10.0, 10.0)));
     let nodes = cx.access_nodes(&mut IdTable::new());
     assert!(nodes.nodes.is_empty() && nodes.roots.is_empty() && nodes.focus.is_none());
+}
+
+/// A press on a part of a stop that a clip cuts away focuses nothing, as it
+/// hits nothing there: focus and hits walk the same way (section 5, rule 7).
+/// The same holds for a slot's panel past its slot.
+#[test]
+fn a_press_outside_a_clip_focuses_nothing() {
+    let wide = stop("aaaaaa").width(Length::Fixed(48.0)).min_width(48.0);
+    let clipped = Element::row([wide]).width(Length::Fixed(20.0)).min_width(0.0).clip();
+    let mut harness = showing(vec![panel("bar", clipped)]);
+    assert_eq!(harness.focus_at(Point::new(2.0, 2.0)), Some(id("bar", "aaaaaa")));
+    assert_eq!(harness.focus_at(Point::new(30.0, 2.0)), None, "cut away by the clip");
+
+    let host = Element::row([Element::slot(UiId::panel("child"))
+        .width(Length::Fixed(20.0))
+        .height(Length::Fixed(16.0))
+        .min_width(0.0)]);
+    let child = Element::row([stop("bbbbbb").width(Length::Fixed(48.0)).min_width(48.0)]);
+    let mut harness = showing(vec![panel("host", host), panel("child", child)]);
+    assert_eq!(harness.focus_at(Point::new(2.0, 2.0)), Some(id("child", "bbbbbb")));
+    assert_eq!(harness.focus_at(Point::new(30.0, 2.0)), None, "past the slot");
+}
+
+/// A layout through the driver's parts settles the focus as the runtime's
+/// own does: a focus whose element went falls back, and a focus that waited
+/// for its layout is taken. The target cannot be reached through the parts,
+/// so it lets go of its focus at the start of the next turn, before that
+/// turn's key reaches it (section 6, rule 1).
+#[test]
+fn a_layout_through_the_parts_settles_the_focus_before_the_next_key() {
+    let window = WindowState::new(Size::new(400.0, 200.0));
+    let mut harness = Harness::new(Panels::default(), Toolkit::default(), window, Instant::now());
+    harness.send(Message::Show(vec![panel("bar", row(&["a", "b"]))]));
+    harness.parts().2.lay_out(&mut Mono::default());
+    harness.focus_at(Point::new(10.0, 2.0));
+    harness.send(Message::Show(vec![panel("bar", row(&["a"]))]));
+    harness.parts().2.lay_out(&mut Mono::default());
+    assert_eq!(harness.runtime().focused(), Some(&id("bar", "a")), "it fell back");
+
+    harness.send(Message::Focus(UiId::panel("inspector").with("name")));
+    assert!(harness.runtime().target().focused.is_some(), "the toolkit's field");
+    harness.send(Message::ShowAndFocus(
+        vec![panel("bar", row(&["a", "c"]))],
+        id("bar", "c"),
+    ));
+    harness.parts().2.lay_out(&mut Mono::default());
+    assert_eq!(harness.runtime().focused(), Some(&id("bar", "c")), "taken");
+    harness.step(DriverEvent::Input {
+        event: Event::Key(KeyEvent::Pressed {
+            key: Key::Character('x'),
+            modifiers: Modifiers::NONE,
+            repeat: false,
+            text: Some("x".into()),
+        }),
+        pointer: None,
+    });
+    let target = harness.runtime().target();
+    assert_eq!(target.heard_with, [None], "let go before the key reached it");
+    assert_eq!(target.told.last(), Some(&FocusTarget::Nothing));
 }

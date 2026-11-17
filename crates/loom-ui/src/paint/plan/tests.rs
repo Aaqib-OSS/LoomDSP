@@ -70,6 +70,12 @@ fn a_clip_becomes_a_scissor_in_the_target() {
     assert_eq!(scissor(past, target(1.0)), Some([900, 700, 100, 100]));
     let away = Rect::new(Point::new(2000.0, 0.0), Size::new(5.0, 5.0));
     assert_eq!(scissor(away, target(1.0)), None);
+    // Two clips that do not overlap cut to an empty one, at a place that
+    // a fractional scale would round outward into a pixel.
+    let empty = Rect::new(Point::new(1.0, 1.0), Size::ZERO);
+    assert_eq!(scissor(empty, target(1.25)), None, "an empty clip shows nothing");
+    let flat = Rect::new(Point::new(1.0, 1.0), Size::new(5.0, 0.0));
+    assert_eq!(scissor(flat, target(1.25)), None);
 }
 
 /// The plan draws layer by layer and batch by batch in the order painted,
@@ -162,4 +168,14 @@ fn a_full_atlas_skips_glyphs_and_counts_them() {
 fn a_packed_colour_keeps_its_channels() {
     assert_eq!(packed(Color::rgba(0.25, 0.5, 0.75, 0.4)), [0.25, 0.5, 0.75, 0.4]);
     assert_eq!(packed(Color::TRANSPARENT), [0.0, 0.0, 0.0, 0.0]);
+}
+
+/// At scale 2, a clip edge on a half pixel rounds outward to whole physical
+/// pixels: the scissor covers every pixel the clip touches, so nothing a
+/// hit can reach inside the clip is cut away.
+#[test]
+fn a_half_pixel_clip_rounds_out_at_scale_two() {
+    let clip = Rect::new(Point::new(100.25, 50.75), Size::new(10.5, 10.0));
+    // 200.5 to 221.5 across, 101.5 to 121.5 down.
+    assert_eq!(scissor(clip, target(2.0)), Some([200, 101, 22, 21]));
 }
