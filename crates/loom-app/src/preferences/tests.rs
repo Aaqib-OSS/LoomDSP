@@ -7,6 +7,7 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// The full rig configuration, including MIDI clock, reads back as written.
 #[test]
 fn a_full_file_reads_back() {
     let preferences = Preferences {
@@ -20,6 +21,8 @@ fn a_full_file_reads_back() {
         },
         panic: Some(PanicPref::Cc(0, 123)),
         midi: MidiPrefs {
+            clock_source: Some("Keys".into()),
+            send_clock: vec!["Synth".into()],
             off: vec!["Pad Controller MIDI 1".into()],
         },
         author: "Ada Lovelace".into(),
@@ -42,6 +45,10 @@ fn a_full_file_reads_back() {
     midi: (
         off: [
             "Pad Controller MIDI 1",
+        ],
+        clock_source: Some("Keys"),
+        send_clock: [
+            "Synth",
         ],
     ),
     panic: Some(Cc(0, 123)),

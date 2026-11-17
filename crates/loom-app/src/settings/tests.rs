@@ -1788,3 +1788,123 @@ fn a_save_as_answer_after_a_device_change_is_used() {
     assert!(path.is_file(), "the save happened");
     let _ = crate::files::fake::asked();
 }
+
+/// An absent saved source starts on Internal and takes over when its port opens.
+#[test]
+fn midi_clock_preferences_follow_a_reconnected_port() {
+    let dir = folder("midi-clock");
+    write(&dir, "(midi: (clock_source: Some(\"Drums\")))");
+    let fake = Rc::new(Fake::new(&[fake::device("Fake A")], &["Keys"]));
+    fake.midi_outputs.borrow_mut().push("Synth".into());
+    let mut app = start(args(&dir), &fake);
+    assert!(!app.session.controller.follows_midi_clock());
+    app.preferences(Message::Open);
+    fake.plug("Drums");
+    app.poll_midi();
+    assert_eq!(app.rig.following_clock.as_deref(), Some("Drums"));
+    let old_id = app.rig.clock_input;
+    assert_ne!(old_id, Some(MidiInputId(0)));
+    let snapshot = app.ui_snapshot();
+    let tile = snapshot
+        .tiles
+        .iter()
+        .find(|tile| tile.title == "Following Drums clock")
+        .unwrap();
+    assert!(
+        tile.widgets
+            .iter()
+            .any(|widget| widget.label == "Tempo" && widget.inert.is_some())
+    );
+    assert!(
+        tile.widgets
+            .iter()
+            .any(|widget| widget.label == "Run" && widget.inert.is_some())
+    );
+    app.preferences(Message::SendClock("Synth".into(), true));
+    assert_eq!(
+        crate::preferences::load(&dir.join(FILE_NAME))
+            .preferences
+            .midi
+            .send_clock,
+        ["Synth"]
+    );
+    fake.unplug("Drums");
+    app.poll_midi();
+    assert_eq!(app.rig.following_clock.as_deref(), Some("Drums"));
+    assert_eq!(app.rig.clock_input, Some(MidiInputId(0)));
+    let model = app.preferences_model().unwrap();
+    let Some(Part::Picks(clock)) = model.midi.first() else {
+        panic!("the clock source comes first");
+    };
+    assert_eq!(clock.chosen_text(), Some("Drums (not connected)"));
+    fake.plug("Drums");
+    app.poll_midi();
+    assert_ne!(app.rig.clock_input, old_id);
+    app.preferences(Message::ClockSource(None));
+    assert!(!app.session.controller.follows_midi_clock());
+    assert!(app.rig.store.saved().midi.clock_source.is_none());
+}
+
+/// External clock holds local transport controls and reports a loss and recovery.
+#[test]
+fn external_clock_disables_local_edits_and_reports_signal_loss() {
+    let dir = folder("clock-loss");
+    let tape = loom_host_desktop::Tape::new();
+    let fake = Rc::new(Fake {
+        tape: Some(tape.clone()),
+        ..Fake::new(&[fake::device("Fake A")], &["Drums"])
+    });
+    let mut app = start(args(&dir), &fake);
+    app.preferences(Message::ClockSource(Some("Drums".into())));
+    let transport = app.session.controller.transport_module().unwrap();
+    app.session.selection.insert(transport.0);
+    let tempo = app
+        .session
+        .controller
+        .graph()
+        .node(transport)
+        .unwrap()
+        .descriptor
+        .param_index("tempo")
+        .unwrap();
+
+    app.set_param(transport.0, tempo, 160.0);
+    app.toggle_run();
+    assert_eq!(
+        app.session.controller.graph().node(transport).unwrap().params[tempo],
+        120.0
+    );
+    fake.play("Drums", &[0xfa]);
+    fake.play("Drums", &[0xf8]);
+    tape.step(128);
+    app.poll_midi();
+    assert_eq!(crate::transport_running(&app.session.controller), Some(true));
+    let crate::inspector::Inspector::Module(rows) = app.inspector_model() else {
+        panic!("the Transport is selected");
+    };
+    let tempo_row = rows.params.iter().find(|row| row.index == tempo).unwrap();
+    assert!(matches!(tempo_row.mode, crate::inspector::ParamMode::MidiClock));
+    assert!(tempo_row.field.is_none());
+    let update = app.a11y_tree(&crate::places::Places::default());
+    let (_, tempo_node) = update
+        .nodes
+        .iter()
+        .find(|(_, node)| node.role() == accesskit::Role::Slider && node.label() == Some("Tempo"))
+        .expect("the Transport tile has a Tempo slider");
+    assert!(tempo_node.is_disabled());
+    assert!((tempo_node.numeric_value().unwrap() - 120.0).abs() < 0.01);
+    assert!(tempo_node.description().unwrap().contains("BPM"));
+    assert!(!tempo_node.supports_action(accesskit::Action::SetValue));
+
+    tape.step(48_000);
+    app.poll_midi();
+    assert_eq!(
+        app.alerts.status(),
+        "MIDI clock from \"Drums\" stopped. Running at 120.0 BPM."
+    );
+    assert_eq!(crate::transport_running(&app.session.controller), Some(true));
+    fake.play("Drums", &[0xf8]);
+    tape.step(128);
+    app.poll_midi();
+    assert_eq!(app.alerts.status(), "Following Drums clock");
+}
