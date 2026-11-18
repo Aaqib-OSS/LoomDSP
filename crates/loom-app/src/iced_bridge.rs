@@ -319,6 +319,11 @@ impl loom_ui::App for Hosted {
         }
     }
 
+    /// Wakes the app after the runtime updates its window scale.
+    fn window_event(&self, event: &loom_ui::WindowEvent) -> Option<Message> {
+        matches!(event, loom_ui::WindowEvent::ScaleChanged(_)).then_some(Message::WindowRescaled)
+    }
+
     fn next_deadline(&self) -> Option<Deadline<Message>> {
         self.0.next_deadline()
     }
@@ -602,6 +607,9 @@ pub(crate) struct IcedTarget {
     release_first: bool,
     /// The runtime took this turn's key, so Iced must not hear it (`kept`).
     drop_keys: bool,
+    /// Lets a test isolate an app's redraw effect from Iced's update policy.
+    #[cfg(test)]
+    suppress_update_redraw: bool,
 }
 
 impl IcedTarget {
@@ -682,6 +690,10 @@ impl loom_ui::Target<Message> for IcedTarget {
     /// Iced draws after every update, as it always has (section 2, rule
     /// 10: the bridge's habit, deleted with it).
     fn needs_redraw(&mut self, updates: usize) -> bool {
+        #[cfg(test)]
+        if self.suppress_update_redraw {
+            return false;
+        }
         updates > 0
     }
 }
