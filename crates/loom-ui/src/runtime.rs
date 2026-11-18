@@ -34,8 +34,8 @@ use crate::app::{App, Context, Deadline, WindowSpec};
 use crate::draw::Panels;
 use crate::driver::Driver;
 use crate::effect::{Effect, FocusTarget, Selection};
-use crate::event::{DriverEvent, WindowEvent, WindowState};
-use crate::field::FieldEvent;
+use crate::event::{AccessEvent, DriverEvent, WindowEvent, WindowState};
+use crate::field::{FieldAction, FieldEvent};
 use crate::focus::{Focus, FocusStep};
 use crate::hit::Hit;
 use crate::pointer::Pointer;
@@ -43,6 +43,7 @@ use crate::routing::{Routed, Target};
 use crate::view::{Layer, View};
 use crate::waker::{Wake, Waker};
 use crate::window::Window;
+use accesskit::{Action as KitAction, ActionData};
 use loom_ui_core::{Event, Key, KeyEvent, Platform, Point, PointerEvent, Rect, TextMeasure, UiId};
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver};
@@ -551,13 +552,7 @@ impl<A: App, T: Target<A::Message>> Runtime<A, T> {
         };
         // A field in a layer below the one taking input, such as a panel
         // under a question, edits nothing: the key goes on.
-        let layer = self.app.input().layer;
-        let Some(id) = self
-            .focus
-            .id()
-            .cloned()
-            .filter(|id| self.panels.fields.has(id) && self.panels.layer_of(id).is_some_and(|its| its >= layer))
-        else {
+        let Some(id) = self.focus.id().cloned().filter(|id| self.field_takes_input(id)) else {
             return (false, false);
         };
         let used = self.panels.fields.key(&id, key, now, Platform::current());
@@ -578,6 +573,90 @@ impl<A: App, T: Target<A::Message>> Runtime<A, T> {
             batch.extend(self.app.field_event(&id, &FieldEvent::Committed(text())));
         }
         (used.taken, used.redraw)
+    }
+
+    /// Whether the field with UI ID `id` takes input now: it is one of the
+    /// runtime's fields, not turned off (section 7, rule 22), and not
+    /// below [`App::input`]'s layer (section 5, rule 3). A key and a screen
+    /// reader's text action both ask this, so the two follow one rule.
+    fn field_takes_input(&self, id: &UiId) -> bool {
+        // Its element must still be in its panel: a rebuild may have
+        // removed it before the layout that drops its state.
+        self.panels.fields.has(id)
+            && self.panels.has_node(id)
+            && !self
+                .panels
+                .access_of(id)
+                .is_some_and(crate::access::Access::is_disabled)
+            && self.in_input_layer(id)
+    }
+
+    /// Whether the element with UI ID `id` is in a layer that takes input
+    /// now: at or above [`App::input`]'s layer (section 5, rule 3). A
+    /// field's keys and actions and a keyboard click all ask this, so they
+    /// follow one rule.
+    fn in_input_layer(&self, id: &UiId) -> bool {
+        let layer = self.app.input().layer;
+        self.panels.layer_of(id).is_some_and(|its| its >= layer)
+    }
+
+    /// A screen reader's text action on one of the runtime's fields
+    /// (section 7, rule 10): SetValue, ReplaceSelectedText, or
+    /// SetTextSelection, on a field's node or one of its runs. The runtime
+    /// carries it out, and an edit becomes the app's
+    /// [`FieldEvent::Edited`], in `batch`. Returns whether what the field
+    /// reports changed, or `None` for an event that is not such an action,
+    /// which goes to the app. A request with the wrong data, or naming a
+    /// place past the text, does nothing. It never moves focus: only Focus
+    /// does (rule 9).
+    fn field_action(&mut self, event: &AccessEvent, now: Instant, batch: &mut Vec<A::Message>) -> Option<bool> {
+        let AccessEvent::Action(request) = event else {
+            return None;
+        };
+        if !matches!(
+            request.action,
+            KitAction::SetValue | KitAction::ReplaceSelectedText | KitAction::SetTextSelection
+        ) {
+            return None;
+        }
+        let target = self.app.access_target(request.target_node)?;
+        let field = self.panels.fields.owner_of(&target)?.clone();
+        // A field below the layer taking input, or turned off, takes no
+        // screen reader action (section 5, rule 3; rule 22): the action is
+        // used up and changes nothing, so nothing is reported.
+        if !self.field_takes_input(&field) {
+            return Some(false);
+        }
+        let place = |node: accesskit::NodeId, index: usize| {
+            let id = self.app.access_target(node)?;
+            Some((crate::field::run_index(&field, &id)?, index))
+        };
+        let action = match (request.action, &request.data) {
+            (KitAction::SetValue, Some(ActionData::Value(text))) => Some(FieldAction::SetValue(text.to_string())),
+            (KitAction::ReplaceSelectedText, Some(ActionData::Value(text))) => {
+                Some(FieldAction::ReplaceSelection(text.to_string()))
+            }
+            (KitAction::SetTextSelection, Some(ActionData::SetTextSelection(selection))) => {
+                place(selection.anchor.node, selection.anchor.character_index)
+                    .zip(place(selection.focus.node, selection.focus.character_index))
+                    .map(|(anchor, focus)| FieldAction::Select { anchor, focus })
+            }
+            _ => None,
+        };
+        let Some(action) = action else {
+            return Some(false);
+        };
+        let used = self.panels.fields.act(&field, action, now);
+        if used.edited {
+            let text = self
+                .panels
+                .fields
+                .get(&field)
+                .map(|state| state.text().to_owned())
+                .unwrap_or_default();
+            batch.extend(self.app.field_event(&field, &FieldEvent::Edited(text)));
+        }
+        Some(used.changed)
     }
 
     /// When focus has moved off the text field that had it: the field
@@ -612,7 +691,7 @@ impl<A: App, T: Target<A::Message>> Runtime<A, T> {
         let input = self.app.input();
         // While the canvas has the keyboard, its keys are its own (section
         // 6, rule 1): no element of ours is activated by them.
-        if input.canvas_focused || self.panels.layer_of(id).is_none_or(|layer| layer < input.layer) {
+        if input.canvas_focused || !self.in_input_layer(id) {
             return None;
         }
         let access = self.panels.access_of(id)?;
@@ -818,9 +897,10 @@ impl<A: App, T: Target<A::Message>> Runtime<A, T> {
         self.release_if_owed();
         // The target's own element may have taken the keyboard since the
         // last turn; then a layout between turns, or that, may have moved
-        // focus off a field.
+        // focus off a field, or changed what a field reports.
         let mut redraw = self.follow_target();
         self.field_left(&mut batch);
+        let mut reported = self.panels.fields.take_changed();
 
         // 2. Route the event.
         match event {
@@ -837,6 +917,7 @@ impl<A: App, T: Target<A::Message>> Runtime<A, T> {
                 } else {
                     let (used, changed) = self.field_key(&event, now, driver, &mut batch);
                     redraw |= changed;
+                    reported |= changed;
                     if used {
                         // A key a field took is the field's alone, so a
                         // toolkit that heard it first drops it too.
@@ -852,7 +933,13 @@ impl<A: App, T: Target<A::Message>> Runtime<A, T> {
                 }
             }
             DriverEvent::Window(event) => self.window_event(event, now, &mut batch),
-            DriverEvent::Accessibility(event) => batch.extend(self.app.accessibility_event(&event)),
+            DriverEvent::Accessibility(event) => match self.field_action(&event, now, &mut batch) {
+                Some(changed) => {
+                    redraw |= changed;
+                    reported |= changed;
+                }
+                None => batch.extend(self.app.accessibility_event(&event)),
+            },
             DriverEvent::RedrawRequested => redraw = true,
             DriverEvent::Frame => {
                 self.counts.frames += 1;
@@ -877,6 +964,16 @@ impl<A: App, T: Target<A::Message>> Runtime<A, T> {
             }
             updates += 1;
             redraw |= self.update(message, now, driver);
+        }
+        // What a field reports changed: one notice, asked for after the
+        // turn's updates, so the app's answer is built from its model with
+        // the field's messages in it.
+        if reported
+            && !self.exited
+            && let Some(notice) = self.app.access_changed()
+        {
+            updates += 1;
+            redraw |= self.update(notice, now, driver);
         }
         self.counts.updates += updates as u64;
 

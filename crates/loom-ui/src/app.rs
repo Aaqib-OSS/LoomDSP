@@ -101,6 +101,28 @@ pub trait App {
         None
     }
 
+    /// The UI ID of the node `node` names, from the app's node table, so
+    /// the runtime can carry out a screen reader's text actions on its own
+    /// fields (ui-layer.md, section 7, rule 10). An app with no table, or
+    /// none of the runtime's fields, gives `None`, and every action goes
+    /// to [`App::accessibility_event`].
+    fn access_target(&self, node: accesskit::NodeId) -> Option<UiId> {
+        let _ = node;
+        None
+    }
+
+    /// The message for "what a field reports to a screen reader changed":
+    /// its text, its caret, its selection, or its scroll (section 7, rule
+    /// 7). An edit gives both: [`FieldEvent::Edited`](crate::FieldEvent::Edited)
+    /// through [`App::field_event`], then this notice in the same turn. The runtime asks at most once per turn,
+    /// after that turn's updates have run, field messages included, so the
+    /// answer is built from a model that holds them, and runs it as one
+    /// more update; the app can send a new tree there. An app with no screen reader listening gives `None`, which
+    /// costs nothing.
+    fn access_changed(&self) -> Option<Self::Message> {
+        None
+    }
+
     /// True while something on screen moves and needs a frame each display
     /// refresh. A frame draws and runs no update.
     fn animating(&self) -> bool {
@@ -248,7 +270,11 @@ impl<'a, M> Context<'a, M> {
     /// any other does, through [`App::accessibility_event`]. The app turns
     /// it into a message by the UI ID its table gives (section 7, rule 6),
     /// and a Focus action into [`Effects::focus`](crate::Effects::focus).
-    /// Empty outside a runtime.
+    /// The one exception is a text field's: when [`App::access_target`]
+    /// names a field or its run, the runtime carries out SetValue,
+    /// ReplaceSelectedText, and SetTextSelection itself, and an edit reaches
+    /// the app through [`App::field_event`] (rule 10). Focus on a field
+    /// still comes through `accessibility_event`. Empty outside a runtime.
     pub fn access_nodes(&self, ids: &mut IdTable) -> AccessNodes {
         self.panels.map_or_else(AccessNodes::default, |panels| {
             panels.access_nodes(ids, self.window.scale, self.focused.as_ref())

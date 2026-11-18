@@ -11,7 +11,7 @@
 //! typesetter's tests do.
 
 use super::{CARET_MARGIN, FieldEvent, FieldState, TYPING_PAUSE};
-use crate::access::{Access, Role};
+use crate::access::{Access, Role, States};
 use crate::app::{App, Context, WindowSpec};
 use crate::effect::Effects;
 use crate::effect::{FocusTarget, Selection as FocusSelection};
@@ -466,8 +466,19 @@ enum Message {
     Describe,
     /// Take input only from this layer up, as an open question does.
     Cover(Layer),
+    /// Turn the field off, or back on.
+    TurnOff(bool),
+    /// Take the field out of the form, keeping the panel.
+    Remove,
     /// Focus the first UI ID, then the second, in one update.
     FocusTwice(UiId, UiId),
+    /// What a field reports to a screen reader changed, with the text the
+    /// app held when it was asked.
+    Changed(String),
+    /// The app changes the text it holds.
+    SetText(String),
+    /// A screen reader's action the runtime left to the app.
+    Reader(accesskit::Action),
 }
 
 /// An app with one field, keyed `form/name`, and a button after it. It
@@ -481,6 +492,14 @@ struct Form {
     nodes: Option<AccessNodes>,
     /// The lowest layer that takes input, when not every layer does.
     covered: Option<Layer>,
+    /// The field is turned off.
+    off: bool,
+    /// The field is out of the form.
+    removed: bool,
+    /// The text each notice carried, in order.
+    noticed: Vec<String>,
+    /// Every field message, notice, and screen reader action, in order.
+    log: Vec<String>,
 }
 
 impl App for Form {
@@ -493,17 +512,31 @@ impl App for Form {
                 if let (FieldEvent::Edited(text), true) = (&event, self.keeps) {
                     self.text.clone_from(text);
                 }
+                self.log.push(format!("{event:?}"));
                 self.heard.push(event);
             }
             Message::Describe => self.nodes = Some(cx.access_nodes(&mut self.ids)),
             Message::Cover(layer) => self.covered = Some(layer),
             Message::FocusTwice(first, second) => return Effects::focus(first).and(Effects::focus(second)),
+            Message::Changed(text) => {
+                self.log.push("changed".to_owned());
+                self.noticed.push(text);
+            }
+            Message::TurnOff(off) => self.off = off,
+            Message::Remove => self.removed = true,
+            Message::SetText(text) => self.text = text,
+            Message::Reader(action) => self.log.push(format!("reader {action:?}")),
         }
         Effects::none()
     }
 
     fn view(&self, view: &mut View) {
-        view.panel_with(UiId::panel("form"), Layer::Panels, &self.text, form_panel);
+        view.panel_with(
+            UiId::panel("form"),
+            Layer::Panels,
+            &(self.text.clone(), self.off, self.removed),
+            form_panel,
+        );
     }
 
     fn window(&self) -> WindowSpec {
@@ -520,26 +553,45 @@ impl App for Form {
         }
     }
 
+    fn access_target(&self, node: accesskit::NodeId) -> Option<UiId> {
+        self.ids.id(node.0).cloned()
+    }
+
+    fn access_changed(&self) -> Option<Message> {
+        Some(Message::Changed(self.text.clone()))
+    }
+
+    fn accessibility_event(&self, event: &crate::event::AccessEvent) -> Option<Message> {
+        match event {
+            crate::event::AccessEvent::Action(request) => Some(Message::Reader(request.action)),
+            _ => None,
+        }
+    }
+
     fn field_event(&self, id: &UiId, event: &FieldEvent) -> Option<Message> {
         assert_eq!(*id, name());
         Some(Message::Field(event.clone()))
     }
 }
 
-/// The form's panel: the field showing `text`, then an OK button.
-#[expect(
-    clippy::ptr_arg,
-    reason = "`View::panel_with` hands the builder its model, a `String`, by reference"
-)]
-fn form_panel(text: &String) -> Element {
+/// The form's panel: the field showing `text`, turned off if `off`, then
+/// an OK button; with `removed`, the button alone.
+fn form_panel((text, off, removed): &(String, bool, bool)) -> Element {
+    let states = States {
+        disabled: *off,
+        ..States::default()
+    };
     let field = Element::field(text.clone(), STYLE)
         .key("name")
         .width(Length::Fixed(120.0))
-        .access(Access::new(Role::TextInput, "Name"));
+        .access(Access::new(Role::TextInput, "Name").states(states));
     let button = Element::text("OK", STYLE)
         .key("ok")
         .focusable()
         .access(Access::new(Role::Button, "OK").action(crate::access::Action::Click));
+    if *removed {
+        return Element::row([button]);
+    }
     Element::row([field, button])
 }
 
@@ -1033,4 +1085,719 @@ fn focus_away_and_back_in_one_update_leaves_the_field() {
     harness.step(key_in(Key::Character('z'), shortcut(Platform::current(), false), None));
     harness.lay_out(&mut text);
     assert_eq!(harness.app().text, "ab", "no undo step was left");
+}
+
+// --- For a screen reader (section 7, rules 7 and 10) ---
+
+/// A run's characters are the editor's clusters: their lengths add up to
+/// the text, a three-byte ideograph is one character, and an empty field
+/// has one empty run.
+#[test]
+fn a_run_has_one_character_per_cluster() {
+    let Some(bench) = field_in("日本a", 300.0) else {
+        return;
+    };
+    let runs = bench.field.runs();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].text, "日本a");
+    assert_eq!(runs[0].lengths, [3, 3, 1]);
+    let Some(bench) = field_in("", 300.0) else { return };
+    assert_eq!(bench.field.runs(), [super::ReaderRun::default()]);
+}
+
+/// Positions go up along the line, and every width is positive.
+#[test]
+fn a_runs_positions_go_up_and_its_widths_are_positive() {
+    let Some(bench) = field_in("Wavy fA 日本", 300.0) else {
+        return;
+    };
+    let run = &bench.field.runs()[0];
+    assert!(
+        run.positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "{:?}",
+        run.positions
+    );
+    assert!(run.widths.iter().all(|width| *width > 0.0), "{:?}", run.widths);
+    assert_eq!(run.positions[0], 0.0);
+}
+
+/// A run's word starts are where moving left by word stops, so a screen
+/// reader and the keyboard agree on where words begin. (Moving right stops
+/// at word ends.) The space after a word belongs to it, as AccessKit says.
+#[test]
+fn word_starts_are_where_word_movement_stops() {
+    let mut texts = vec!["one  two", "a-b c", "one two three"];
+    if cfg!(feature = "complex-scripts") {
+        texts.push("日本 abc");
+    }
+    for text in texts {
+        let Some(mut bench) = field_in(text, 300.0) else { return };
+        let mut stops = Vec::new();
+        loop {
+            bench.hit(Platform::Mac, Key::Left, word(Platform::Mac, false));
+            let at = bench.caret();
+            if stops.last() == Some(&at) {
+                break;
+            }
+            stops.push(at);
+            if at == 0 {
+                break;
+            }
+        }
+        stops.reverse();
+        let run = &bench.field.runs()[0];
+        let starts: Vec<usize> = run
+            .word_starts
+            .iter()
+            .map(|&start| {
+                run.lengths[..usize::from(start)]
+                    .iter()
+                    .map(|&length| usize::from(length))
+                    .sum()
+            })
+            .collect();
+        assert_eq!(starts, stops, "{text:?}");
+    }
+}
+
+/// Right-to-left text, alone or mixed with Latin, builds runs whose
+/// lengths still add up to the text.
+#[test]
+fn right_to_left_text_builds_runs() {
+    for text in ["שלום", "abc שלום def"] {
+        let Some(bench) = field_in(text, 300.0) else { return };
+        let total: usize = bench
+            .field
+            .runs()
+            .iter()
+            .flat_map(|run| run.lengths.iter().map(|&length| usize::from(length)))
+            .sum();
+        assert_eq!(total, text.len(), "{text:?}");
+    }
+}
+
+/// A text longer than one run splits into runs of at most 255 characters,
+/// and the caret at the end is at the last run's length.
+#[test]
+fn a_long_text_splits_into_runs() {
+    let text = "a".repeat(300);
+    let Some(bench) = field_in(&text, 3000.0) else { return };
+    let runs = bench.field.runs();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].lengths.len(), super::RUN_CHARACTERS);
+    assert_eq!(runs[0].text.len() + runs[1].text.len(), 300);
+    assert_eq!(bench.field.reader_selection(), ((1, 45), (1, 45)));
+}
+
+/// The selection is given as characters in a run: after Shift+Left over
+/// an ideograph, it runs from the end back one character.
+#[test]
+fn the_selection_is_given_in_characters() {
+    let Some(mut bench) = field_in("日本a", 300.0) else {
+        return;
+    };
+    assert_eq!(bench.field.reader_selection(), ((0, 3), (0, 3)));
+    bench.hit(Platform::Mac, Key::Left, SHIFT);
+    bench.hit(Platform::Mac, Key::Left, SHIFT);
+    assert_eq!(bench.field.reader_selection(), ((0, 3), (0, 1)));
+}
+
+/// SetValue takes the text as one step with the caret at the end;
+/// ReplaceSelection never joins the typing before it; Select picks by
+/// character, and a place past the text does nothing.
+#[test]
+fn a_screen_readers_actions_edit_and_select() {
+    use super::FieldAction;
+    let Some(mut bench) = field_in("", 300.0) else { return };
+    let Bench {
+        field,
+        fonts,
+        layouts,
+        now,
+    } = &mut bench;
+    let set = field.act(FieldAction::SetValue("日本".to_owned()), *now, fonts, layouts);
+    assert!(set.edited && set.changed);
+    assert_eq!(
+        (field.text(), field.selection_bytes(), field.steps()),
+        ("日本", (6, 6), (1, 0))
+    );
+
+    let select = FieldAction::Select {
+        anchor: (0, 0),
+        focus: (0, 1),
+    };
+    assert!(field.act(select, *now, fonts, layouts).changed);
+    assert_eq!(field.selection_bytes(), (0, 3));
+    let stale = FieldAction::Select {
+        anchor: (0, 0),
+        focus: (0, 9),
+    };
+    assert!(!field.act(stale, *now, fonts, layouts).changed);
+
+    let Some(mut bench) = field_in("", 300.0) else { return };
+    bench.type_text(Platform::Mac, "ab");
+    let Bench {
+        field,
+        fonts,
+        layouts,
+        now,
+    } = &mut bench;
+    field.act(FieldAction::ReplaceSelection("c".to_owned()), *now, fonts, layouts);
+    assert_eq!(field.text(), "abc");
+    bench.hit(Platform::Mac, Key::Character('z'), shortcut(Platform::Mac, false));
+    assert_eq!(bench.text(), "ab");
+}
+
+/// The form's nodes, made after a layout: the field's node ID and node,
+/// and its runs' IDs.
+fn describe(harness: &mut Harness<Form, Keys>, text: &mut Typesetter) -> (accesskit::NodeId, accesskit::Node) {
+    harness.lay_out(text);
+    harness.send(Message::Describe);
+    let nodes = harness.app().nodes.as_ref().expect("nodes");
+    let (id, node) = nodes
+        .nodes
+        .iter()
+        .find(|(_, node)| node.role() == KitRole::TextInput)
+        .expect("a text input");
+    (*id, node.clone())
+}
+
+/// A screen reader's action on `target`, as the driver sends it.
+fn reader(action: accesskit::Action, target: accesskit::NodeId, data: Option<accesskit::ActionData>) -> DriverEvent {
+    DriverEvent::Accessibility(crate::event::AccessEvent::Action(accesskit::ActionRequest {
+        action,
+        target_tree: accesskit::TreeId::ROOT,
+        target_node: target,
+        data,
+    }))
+}
+
+/// The field's node holds its runs as children, names them in its text
+/// selection, and offers the three text actions with Focus.
+#[test]
+fn the_field_node_holds_its_runs_and_selection() {
+    let Some((mut harness, mut text)) = form("hi", true) else {
+        return;
+    };
+    let (_, node) = describe(&mut harness, &mut text);
+    let runs = node.children();
+    assert_eq!(runs.len(), 1);
+    let selection = node.text_selection().expect("a selection");
+    assert_eq!(selection.focus.node, runs[0]);
+    assert_eq!(selection.focus.character_index, 2);
+    for action in [
+        accesskit::Action::Focus,
+        accesskit::Action::SetValue,
+        accesskit::Action::SetTextSelection,
+        accesskit::Action::ReplaceSelectedText,
+    ] {
+        assert!(node.supports_action(action), "{action:?}");
+    }
+    let nodes = harness.app().nodes.as_ref().expect("nodes");
+    let run = &nodes.nodes.iter().find(|(id, _)| *id == runs[0]).expect("the run").1;
+    assert_eq!(run.role(), KitRole::TextRun);
+    assert_eq!(run.value(), Some("hi"));
+    assert_eq!(run.character_lengths(), [1, 1]);
+}
+
+/// A key that moves the caret gives one notice, after the field's own
+/// message for an edit; a key that changes nothing, and turns with nothing
+/// to do, give none.
+#[test]
+fn what_the_tree_reports_changing_gives_one_notice() {
+    let Some((mut harness, _text)) = form("abc", true) else {
+        return;
+    };
+    let start = harness.app().log.len();
+    harness.step(key_in(Key::Left, Modifiers::NONE, None));
+    assert_eq!(harness.app().log[start..], ["changed"]);
+    harness.step(key_in(Key::Character('x'), Modifiers::NONE, Some("x")));
+    assert_eq!(harness.app().log[start + 1..], ["Edited(\"abxc\")", "changed"]);
+    let quiet = harness.app().log.len();
+    harness.step(key_in(Key::End, Modifiers::NONE, None));
+    harness.step(key_in(Key::End, Modifiers::NONE, None));
+    harness.step(DriverEvent::Woken);
+    harness.step(DriverEvent::Woken);
+    assert_eq!(harness.app().log[quiet..], ["changed"], "only the first End moved");
+}
+
+/// A text the app changes reaches the field at the next layout, and the
+/// clamped caret gives one notice on the turn after.
+#[test]
+fn a_change_found_in_layout_gives_a_notice_next_turn() {
+    let Some((mut harness, mut text)) = form("abcdef", true) else {
+        return;
+    };
+    harness.send(Message::SetText("ab".to_owned()));
+    harness.lay_out(&mut text);
+    let start = harness.app().log.len();
+    harness.step(DriverEvent::Woken);
+    assert_eq!(harness.app().log[start..], ["changed"]);
+    harness.step(DriverEvent::Woken);
+    assert_eq!(harness.app().log.len(), start + 1);
+}
+
+/// A screen reader's SetTextSelection on the field selects by character,
+/// without moving focus to it, and gives one notice; SetValue edits and
+/// reaches the app as `Edited`. Focus, and actions on other nodes, still
+/// go to the app.
+#[test]
+fn a_screen_readers_text_actions_are_the_fields() {
+    use accesskit::{Action, ActionData, TextPosition, TextSelection};
+    let Some((mut harness, mut text)) = form("abc", true) else {
+        return;
+    };
+    let (field, node) = describe(&mut harness, &mut text);
+    let run = node.children()[0];
+    harness.step(key_in(Key::Tab, Modifiers::NONE, None));
+    harness.lay_out(&mut text);
+    let ok = UiId::panel("form").with("ok");
+    assert_eq!(harness.runtime().focused(), Some(&ok));
+
+    let start = harness.app().log.len();
+    let position = |character_index| TextPosition {
+        node: run,
+        character_index,
+    };
+    let selection = TextSelection {
+        anchor: position(0),
+        focus: position(2),
+    };
+    harness.step(reader(
+        Action::SetTextSelection,
+        field,
+        Some(ActionData::SetTextSelection(selection)),
+    ));
+    assert_eq!(harness.runtime().focused(), Some(&ok), "only Focus moves focus");
+    assert_eq!(harness.app().log[start..], ["changed"]);
+
+    harness.step(reader(Action::SetValue, field, Some(ActionData::Value("new".into()))));
+    assert_eq!(harness.app().log[start + 1..], ["Edited(\"new\")", "changed"]);
+    harness.step(reader(Action::SetValue, field, None));
+    assert_eq!(harness.app().log.len(), start + 3, "no data, no change");
+
+    harness.step(reader(Action::Focus, field, None));
+    assert_eq!(harness.app().log.last().map(String::as_str), Some("reader Focus"));
+}
+
+/// A cluster longer than one byte can count, a letter with hundreds of
+/// combining marks, splits into pieces: the lengths still add up to the
+/// text, none is zero, and a caret after the last letter is at the end.
+#[test]
+fn a_cluster_longer_than_255_bytes_splits_into_pieces() {
+    let text = format!("a{}b", "\u{301}".repeat(150));
+    let Some(mut bench) = field_in(&text, 3000.0) else {
+        return;
+    };
+    bench.hit(Platform::Mac, Key::End, Modifiers::NONE);
+    let runs = bench.field.runs();
+    let lengths: Vec<u8> = runs.iter().flat_map(|run| run.lengths.iter().copied()).collect();
+    assert_eq!(
+        lengths.iter().map(|&length| usize::from(length)).sum::<usize>(),
+        text.len()
+    );
+    assert!(lengths.iter().all(|&length| length > 0));
+    assert!(lengths.len() >= 3, "{lengths:?}");
+    let positions = &runs[0].positions;
+    assert!(positions.windows(2).all(|pair| pair[0] <= pair[1]), "{positions:?}");
+    // The pieces after the first stand at the cluster's trailing edge,
+    // with no width: no caret stands inside a cluster, and the one after
+    // the last piece reports the cluster's end.
+    assert_eq!(positions[1], positions[0] + runs[0].widths[0], "{positions:?}");
+    assert_eq!(runs[0].widths[1], 0.0);
+    let ((_, _), (run, index)) = bench.field.reader_selection();
+    assert_eq!((run, index), (runs.len() - 1, runs[runs.len() - 1].lengths.len()));
+}
+
+/// At a scale of 2, a run's bounds and its character positions and widths
+/// are in the same physical pixels as the field node's bounds.
+#[test]
+fn a_runs_units_match_the_field_nodes_at_scale_two() {
+    let Some((mut harness, mut text)) = form("ab", true) else {
+        return;
+    };
+    harness.step(DriverEvent::Window(WindowEvent::ScaleChanged(2.0)));
+    let (_, field) = describe(&mut harness, &mut text);
+    let nodes = harness.app().nodes.as_ref().expect("nodes");
+    let run = &nodes
+        .nodes
+        .iter()
+        .find(|(id, _)| *id == field.children()[0])
+        .expect("the run")
+        .1;
+    let field_bounds = field.bounds().expect("field bounds");
+    let run_bounds = run.bounds().expect("run bounds");
+    let widths = run.character_widths().expect("widths");
+    let positions = run.character_positions().expect("positions");
+    let last = positions.len() - 1;
+    let ink = f64::from(positions[last] + widths[last]);
+    assert!(
+        (ink - (run_bounds.x1 - run_bounds.x0)).abs() < 0.01,
+        "{ink} against {run_bounds:?}"
+    );
+    let logical = bench_width("ab");
+    assert!(
+        (ink - 2.0 * f64::from(logical)).abs() < 0.01,
+        "{ink} against 2 x {logical}"
+    );
+    assert!(run_bounds.x0 >= field_bounds.x0 && run_bounds.x1 <= field_bounds.x1 + 0.01);
+}
+
+/// The width of `text` on one line, in logical pixels.
+fn bench_width(text: &str) -> f32 {
+    field_in(text, 3000.0).map_or(0.0, |bench| bench.field.text_width())
+}
+
+/// While a layer above the field takes input, such as an open question,
+/// the field takes no screen reader text action (section 5, rule 3):
+/// SetTextSelection, SetValue, and ReplaceSelectedText leave its text and
+/// selection as they were, with no message and no notice, and nothing goes
+/// on to the app. Once the cover is gone, the same three work.
+#[test]
+fn a_covered_field_takes_no_text_actions() {
+    use accesskit::{Action, ActionData, TextPosition, TextSelection};
+    let Some((mut harness, mut text)) = form("abc", true) else {
+        return;
+    };
+    let (field, node) = describe(&mut harness, &mut text);
+    let run = node.children()[0];
+    let selection = TextSelection {
+        anchor: TextPosition {
+            node: run,
+            character_index: 0,
+        },
+        focus: TextPosition {
+            node: run,
+            character_index: 2,
+        },
+    };
+    let actions = [
+        (Action::SetTextSelection, ActionData::SetTextSelection(selection)),
+        (Action::SetValue, ActionData::Value("new".into())),
+        (Action::ReplaceSelectedText, ActionData::Value("x".into())),
+    ];
+
+    harness.send(Message::Cover(Layer::Question));
+    harness.lay_out(&mut text);
+    let start = harness.app().log.len();
+    for (action, data) in actions.clone() {
+        harness.step(reader(action, field, Some(data)));
+        harness.lay_out(&mut text);
+    }
+    let (_, after) = describe(&mut harness, &mut text);
+    assert_eq!(after.text_selection(), node.text_selection(), "the selection stayed");
+    assert_eq!(harness.app().text, "abc");
+    assert_eq!(harness.app().log.len(), start, "{:?}", &harness.app().log[start..]);
+
+    harness.send(Message::Cover(Layer::Canvas));
+    harness.lay_out(&mut text);
+    for (action, data) in actions {
+        harness.step(reader(action, field, Some(data)));
+        harness.lay_out(&mut text);
+    }
+    assert_eq!(harness.app().text, "newx", "SetValue, then the replacement at its end");
+    assert_eq!(
+        harness.app().log[start..],
+        ["changed", "Edited(\"new\")", "changed", "Edited(\"newx\")", "changed"]
+    );
+}
+
+/// A screen reader's text is made one line, as the field shows one: each
+/// line break becomes a space and a break at the end goes, for SetValue
+/// and ReplaceSelectedText alike. An empty text still clears.
+#[test]
+fn a_screen_readers_text_is_one_line() {
+    use super::{FieldAction, one_line};
+    assert_eq!(one_line("one\r\ntwo\n"), "one two");
+    assert_eq!(one_line("a\rb"), "a b");
+    assert_eq!(one_line("cell\tcell"), "cell cell", "a tab separates words");
+    assert_eq!(one_line("a\u{7}b"), "ab", "other control characters go");
+    assert_eq!(
+        one_line("a\u{2028}b\u{2029}c\u{2029}"),
+        "a b c",
+        "line and paragraph separators"
+    );
+    assert_eq!(one_line(""), "");
+    let Some(mut bench) = field_in("", 300.0) else { return };
+    let Bench {
+        field,
+        fonts,
+        layouts,
+        now,
+    } = &mut bench;
+    field.act(FieldAction::SetValue("A\nB".to_owned()), *now, fonts, layouts);
+    assert_eq!(field.text(), "A B");
+    field.act(
+        FieldAction::ReplaceSelection("\nC\r\n".to_owned()),
+        *now,
+        fonts,
+        layouts,
+    );
+    assert_eq!(field.text(), "A B C");
+    field.act(FieldAction::SetValue(String::new()), *now, fonts, layouts);
+    assert_eq!(field.text(), "");
+}
+
+/// A selection's ends are checked against the run they name: past a run's
+/// length, or in a run the field does not have, the request is stale and
+/// does nothing. A run's length is its end, the next run's start.
+#[test]
+fn a_selection_end_must_be_inside_its_run() {
+    use super::FieldAction;
+    let text = "x".repeat(300);
+    let Some(mut bench) = field_in(&text, 3000.0) else {
+        return;
+    };
+    let Bench {
+        field,
+        fonts,
+        layouts,
+        now,
+    } = &mut bench;
+    let select = |anchor, focus| FieldAction::Select { anchor, focus };
+    assert!(!field.act(select((0, 0), (0, 256)), *now, fonts, layouts).changed);
+    assert!(!field.act(select((0, 0), (2, 0)), *now, fonts, layouts).changed);
+    assert!(field.act(select((0, 0), (0, 255)), *now, fonts, layouts).changed);
+    assert_eq!(field.selection_bytes(), (0, 255));
+    field.act(select((1, 45), (1, 45)), *now, fonts, layouts);
+    assert_eq!(field.selection_bytes(), (300, 300), "the last run's end");
+}
+
+/// A stale selection leaves the typing run as it was, so the letter typed
+/// after it joins the same undo step.
+#[test]
+fn a_stale_selection_keeps_the_typing_run() {
+    use super::FieldAction;
+    let Some(mut bench) = field_in("", 300.0) else { return };
+    bench.type_text(Platform::Mac, "ab");
+    let stale = FieldAction::Select {
+        anchor: (0, 0),
+        focus: (0, 9),
+    };
+    let use_ = bench.field.act(stale, bench.now, &mut bench.fonts, &mut bench.layouts);
+    assert_eq!(use_, super::ActUse::default());
+    bench.type_text(Platform::Mac, "c");
+    bench.hit(Platform::Mac, Key::Character('z'), shortcut(Platform::Mac, false));
+    assert_eq!(bench.text(), "", "one step for abc");
+}
+
+/// Selecting a piece of a cluster split for AccessKit selects the whole
+/// cluster, since the editor selects whole clusters only, so a replacement
+/// after it replaces the cluster rather than inserting beside it.
+#[test]
+fn selecting_a_piece_of_a_split_cluster_selects_the_cluster() {
+    use super::FieldAction;
+    let text = format!("a{}b", "\u{301}".repeat(150));
+    let Some(mut bench) = field_in(&text, 3000.0) else {
+        return;
+    };
+    let Bench {
+        field,
+        fonts,
+        layouts,
+        now,
+    } = &mut bench;
+    let cluster = text.len() - 1;
+    let select = FieldAction::Select {
+        anchor: (0, 0),
+        focus: (0, 1),
+    };
+    field.act(select, *now, fonts, layouts);
+    assert_eq!(field.selection_bytes(), (0, cluster), "the whole cluster");
+    field.act(FieldAction::ReplaceSelection("x".to_owned()), *now, fonts, layouts);
+    assert_eq!(field.text(), "xb");
+}
+
+/// A turned-off field takes no screen reader text action (rule 22): its
+/// node offers none, and a request that comes anyway changes nothing and
+/// gives no message. Turned back on, it takes them again.
+#[test]
+fn a_turned_off_field_takes_no_text_actions() {
+    use accesskit::{Action, ActionData};
+    let Some((mut harness, mut text)) = form("abc", true) else {
+        return;
+    };
+    let (field, _) = describe(&mut harness, &mut text);
+    harness.send(Message::TurnOff(true));
+    harness.lay_out(&mut text);
+    let (_, off_node) = describe(&mut harness, &mut text);
+    for action in [Action::SetValue, Action::SetTextSelection, Action::ReplaceSelectedText] {
+        assert!(!off_node.supports_action(action), "{action:?} offered while off");
+    }
+    // Focus leaves the field as it turns off, and the app hears Left.
+    harness.step(DriverEvent::Woken);
+    assert_eq!(harness.app().log.last().map(String::as_str), Some("Left"));
+    let start = harness.app().log.len();
+    harness.step(reader(Action::SetValue, field, Some(ActionData::Value("new".into()))));
+    harness.lay_out(&mut text);
+    assert_eq!(harness.app().text, "abc");
+    assert_eq!(harness.app().log.len(), start, "{:?}", &harness.app().log[start..]);
+    harness.send(Message::TurnOff(false));
+    harness.lay_out(&mut text);
+    harness.step(reader(Action::SetValue, field, Some(ActionData::Value("new".into()))));
+    assert_eq!(harness.app().text, "new");
+}
+
+/// The notice is asked for after the turn's updates, so an app that puts
+/// its text in the notice puts the new text there, not the old.
+#[test]
+fn the_notice_is_built_after_the_turns_updates() {
+    use accesskit::{Action, ActionData};
+    let Some((mut harness, mut text)) = form("abc", true) else {
+        return;
+    };
+    let (field, _) = describe(&mut harness, &mut text);
+    harness.step(reader(Action::SetValue, field, Some(ActionData::Value("new".into()))));
+    assert_eq!(harness.app().noticed.last().map(String::as_str), Some("new"));
+}
+
+/// A run is built in one pass over the line, not one per cluster: for a
+/// field of 1,000 characters, building its runs visits each cluster a fixed
+/// number of times (once for its place, once in text order), so the cost
+/// grows with the text, not with its square. The count covers this
+/// crate's own loops only and cannot see inside Parley; that no call per
+/// cluster walks the line (as `Cluster::visual_offset` does) is shown by
+/// the code, which no longer makes one.
+#[test]
+fn runs_are_built_in_linear_time() {
+    let text = "x".repeat(1000);
+    let Some(bench) = field_in(&text, 30000.0) else {
+        return;
+    };
+    super::VISITS.with(|visits| visits.set(0));
+    let runs = bench.field.runs();
+    let visits = super::VISITS.with(std::cell::Cell::get);
+    assert_eq!(runs.iter().map(|run| run.lengths.len()).sum::<usize>(), 1000);
+    assert!(visits <= 2 * 1000 + 2, "{visits} visits for 1000 clusters");
+}
+
+/// A request naming a run far past the field's, as a made-up or stale
+/// node could, is stale and does nothing: the run is checked before it is
+/// multiplied, so a huge index cannot overflow.
+#[test]
+fn a_huge_run_index_is_stale() {
+    use super::FieldAction;
+    let Some(mut bench) = field_in("abc", 300.0) else {
+        return;
+    };
+    let Bench {
+        field,
+        fonts,
+        layouts,
+        now,
+    } = &mut bench;
+    let select = FieldAction::Select {
+        anchor: (usize::MAX, 0),
+        focus: (usize::MAX, usize::MAX),
+    };
+    assert!(!field.act(select, *now, fonts, layouts).changed);
+}
+
+/// A caret placed inside a split cluster stays a caret, at the cluster's
+/// start, so a replacement after it goes in before the cluster rather than
+/// replacing it.
+#[test]
+fn a_caret_inside_a_split_cluster_stays_a_caret() {
+    use super::FieldAction;
+    let text = format!("a{}b", "\u{301}".repeat(150));
+    let Some(mut bench) = field_in(&text, 3000.0) else {
+        return;
+    };
+    let Bench {
+        field,
+        fonts,
+        layouts,
+        now,
+    } = &mut bench;
+    let caret = FieldAction::Select {
+        anchor: (0, 1),
+        focus: (0, 1),
+    };
+    field.act(caret, *now, fonts, layouts);
+    assert_eq!(field.selection_bytes(), (0, 0));
+    field.act(FieldAction::ReplaceSelection("x".to_owned()), *now, fonts, layouts);
+    assert_eq!(field.text(), format!("x{text}"));
+}
+
+/// A field that ends in a split cluster reports a caret after it at the
+/// cluster's end: the last piece's place plus its width is the cluster's
+/// trailing edge, where AccessKit puts that caret.
+#[test]
+fn the_end_caret_after_a_split_cluster_is_at_its_end() {
+    let text = format!("a{}", "\u{301}".repeat(150));
+    let Some(bench) = field_in(&text, 3000.0) else {
+        return;
+    };
+    let runs = bench.field.runs();
+    let run = &runs[0];
+    let last = run.positions.len() - 1;
+    assert_eq!(run.positions[last] + run.widths[last], run.positions[0] + run.widths[0]);
+}
+
+/// Text that changes script often, so the line has many shaped runs,
+/// still gives its characters in text order with lengths that add up,
+/// from one pass: each cluster is visited once.
+#[test]
+fn many_shaped_runs_are_read_in_one_pass() {
+    let text = "a\u{3b1}".repeat(300);
+    let Some(bench) = field_in(&text, 30000.0) else {
+        return;
+    };
+    super::VISITS.with(|visits| visits.set(0));
+    let runs = bench.field.runs();
+    let visits = super::VISITS.with(std::cell::Cell::get);
+    let joined: String = runs.iter().map(|run| run.text.as_str()).collect();
+    assert_eq!(joined, text, "text order");
+    let lengths: usize = runs
+        .iter()
+        .flat_map(|run| run.lengths.iter())
+        .map(|&length| usize::from(length))
+        .sum();
+    assert_eq!(lengths, text.len());
+    assert!(visits <= 600 + 2, "{visits} visits for 600 clusters");
+}
+
+/// A field a rebuild took out of its panel takes no screen reader action
+/// in the gap before the layout that drops its state: no edit, no message.
+#[test]
+fn a_removed_field_takes_no_text_actions() {
+    use accesskit::{Action, ActionData};
+    let Some((mut harness, mut text)) = form("abc", true) else {
+        return;
+    };
+    let (field, _) = describe(&mut harness, &mut text);
+    harness.send(Message::Remove);
+    let start = harness.app().log.len();
+    harness.step(reader(Action::SetValue, field, Some(ActionData::Value("new".into()))));
+    assert_eq!(harness.app().text, "abc");
+    assert!(
+        !harness.app().log[start..].iter().any(|line| line.starts_with("Edited")),
+        "{:?}",
+        &harness.app().log[start..]
+    );
+}
+
+/// A field's runs are one line: each links to its neighbours both ways, so
+/// a screen reader reads the whole field as one line. One run links to
+/// nothing.
+#[test]
+fn a_fields_runs_link_as_one_line() {
+    let Some((mut harness, mut text)) = form(&"x".repeat(300), true) else {
+        return;
+    };
+    let (_, node) = describe(&mut harness, &mut text);
+    let runs = node.children().to_vec();
+    assert_eq!(runs.len(), 2);
+    let nodes = &harness.app().nodes.as_ref().expect("nodes").nodes;
+    let run = |id| {
+        nodes
+            .iter()
+            .find(|(at, _)| *at == id)
+            .map(|(_, node)| node.clone())
+            .expect("run")
+    };
+    assert_eq!(run(runs[0]).next_on_line(), Some(runs[1]));
+    assert_eq!(run(runs[0]).previous_on_line(), None);
+    assert_eq!(run(runs[1]).previous_on_line(), Some(runs[0]));
+    assert_eq!(run(runs[1]).next_on_line(), None);
 }
