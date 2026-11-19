@@ -39,7 +39,7 @@ impl App {
                         app.alerts.say(format!(
                             "Removed {} from {}",
                             mapping.control,
-                            learn::param_name(&app.session.controller, (module, index))
+                            learn::param_name(&app.session.controller, &app.session.hierarchy, (module, index))
                         ));
                     }
                     Ok(None) => {}
@@ -77,7 +77,7 @@ impl App {
             // A live gesture cannot be mapped (transient-params.md).
             self.alerts.warn(format!(
                 "MIDI learn: {} cannot take MIDI mappings",
-                learn::param_name(&self.session.controller, param)
+                learn::param_name(&self.session.controller, &self.session.hierarchy, param)
             ));
             return;
         }
@@ -89,7 +89,7 @@ impl App {
             self.session.learn.arm(param, serial);
             self.alerts.say(format!(
                 "Move a MIDI control to map it to {}",
-                learn::param_name(&self.session.controller, param)
+                learn::param_name(&self.session.controller, &self.session.hierarchy, param)
             ));
         }
         self.refresh_learn();
@@ -181,8 +181,12 @@ impl App {
                 self.session.learn.disarm();
                 self.commit();
                 if let Some(mapping) = mapping {
-                    self.alerts
-                        .say(learn::mapped_status(&self.session.controller, mapping, &removed));
+                    self.alerts.say(learn::mapped_status(
+                        &self.session.controller,
+                        &self.session.hierarchy,
+                        mapping,
+                        &removed,
+                    ));
                 }
             }
             Err(e) => {
@@ -406,6 +410,13 @@ impl App {
         let gained = focus
             .clone()
             .filter(|part| self.focus.as_ref() != Some(part) && self.is_value_field(part));
+        if self.right_tab == crate::matrix::Tab::Inspector
+            && let Some(part) = focus.as_ref()
+            && part.is_under(&UiId::panel("inspector"))
+        {
+            self.session.outline.last_inspector = Some(part.clone());
+            self.session.outline.inspector_action = None;
+        }
         self.focus = focus;
         if let Some(part) = gained {
             self.effect(loom_ui::Effects::focus_and_select_all(part));
@@ -631,10 +642,8 @@ impl App {
         let Some(spec) = graph.node(target).and_then(|n| n.spec(index)) else {
             return;
         };
-        let (from, to) = (
-            modulation::source_name(graph, source),
-            modulation::target_name(graph, target, index),
-        );
+        let names = modulation::Names::new(graph, &self.session.hierarchy);
+        let (from, to) = (names.source(source), names.target(target, index));
         if modulation::exists(graph, source, target, index) {
             self.alerts.warn(format!("{from} already modulates {to}"));
             return;
@@ -692,14 +701,20 @@ impl App {
         let Some(a) = self.session.controller.graph().assignment(id).copied() else {
             return;
         };
-        match self.session.controller.set_assignment_depth(id, a.depth + delta) {
+        match self.change_assignment_depth(id, a.depth + delta) {
             Ok(depth) => {
-                self.fan_out_assignment(id, |c, copy| c.set_assignment_depth(copy, depth).map(|_| ()));
-                self.alerts.say(format!(
-                    "{}: depth {}",
-                    modulation::source_name(self.session.controller.graph(), a.source),
-                    modulation::depth_text(depth)
-                ));
+                let graph = self.session.controller.graph();
+                let name = self.session.scene.module(a.source.module.0).map_or_else(
+                    || modulation::Names::new(graph, &self.session.hierarchy).source(a.source),
+                    |tile| {
+                        let label = graph
+                            .node(a.source.module)
+                            .and_then(|node| node.output_label(a.source.port));
+                        format!("{}: {}", tile.title, label.unwrap_or("?"))
+                    },
+                );
+                self.alerts
+                    .say(format!("{name}: depth {}", modulation::depth_text(depth)));
             }
             Err(e) => self.alerts.warn(e.to_string()),
         }
