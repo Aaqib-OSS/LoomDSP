@@ -275,13 +275,11 @@ pub fn run() -> Result<(), loom_ui::shell::Error> {
     }
     let mut app = App::new(args.clone());
     app.remember_opened_at_start(&args);
-    // The window and its services share the clipboard once it opens.
-    let clipboard = iced_bridge::SharedClipboard::default();
     let result = loom_ui::shell::run(
         iced_bridge::Hosted(app, None, iced_bridge::Extra::default()),
         iced_bridge::IcedTarget::default(),
-        iced_bridge::WindowLayers::new(clipboard.clone()),
-        iced_bridge::AppServices::new(clipboard),
+        iced_bridge::WindowLayers::new(),
+        iced_bridge::AppServices,
         loom_ui::shell::Options {
             size: loom_ui_core::Size::new(WINDOW.width, WINDOW.height),
             // The window is open: the watchers start on the first turn.
@@ -552,7 +550,7 @@ enum Message {
     /// arrives after another patch opened is dropped.
     Pasted {
         world: Point,
-        text: Option<String>,
+        text: loom_ui::ClipboardText,
         generation: u64,
     },
     /// The accessibility tree for screen readers (`a11y.rs`).
@@ -728,8 +726,12 @@ impl Message {
             | Self::Licence(_)
             | Self::OpenRecent
             | Self::Recent(_)
-            | Self::DismissError(_)
-            | Self::Pasted { .. } => false,
+            | Self::DismissError(_) => false,
+            // A refused read says so even under a question, since a read
+            // that began before the question opened can end during it, and
+            // a refusal must never pass silently; it changes no patch. A read
+            // with text waits out the question, as other edits do.
+            Self::Pasted { text, .. } => *text == loom_ui::ClipboardText::Refused,
         }
     }
 }
