@@ -110,7 +110,7 @@ The quick checks run again before push, because commits made by a rebase or a me
 
 `cargo fmt` and the whitespace hooks fix files for you. When they do, the commit stops: review the changes, stage them, and commit again. Run the quick checks by hand with `prek run --all-files`, and the slow ones with `prek run --hook-stage manual --all-files`. The configuration is in `prek.toml`.
 
-The first coverage run builds the workspace again with coverage instrumentation, which takes a few minutes. Later runs only rebuild what changed.
+Every coverage run builds the workspace and its dependencies again with coverage instrumentation, which takes a few minutes, because the task starts by removing earlier instrumented builds (see [Coverage gate](#coverage-gate)).
 
 ### What CI checks
 
@@ -150,7 +150,7 @@ Besides "CI success", the main branch ruleset has a coverage gate from [GitHub C
 **Line coverage.** A pull request is blocked when its line coverage is under 80%, or more than 1 percentage point below `main`. The Coverage job uploads a Cobertura report (`target/cobertura.xml`) with [`actions/upload-code-coverage`](https://github.com/actions/upload-code-coverage), and a bot comments on the pull request with the total and the files that changed. It also sends the coverage (`target/lcov.info`) and the test results to [Codecov](https://codecov.io/gh/brylie/LoomDSP), which comments on the pull request too. Codecov adds two statuses: the lines a pull request changes need 80% coverage (`codecov/patch`), and total coverage may not fall by more than 5% (`codecov/project`).
 
 - The Coverage job itself fails under 80%, so the minimum holds even when the upload does not happen. *Open point:* GitHub Code Quality is only on GitHub Team and Enterprise Cloud plans. On this repository's plan the upload returns "404 Not Found", so the step only warns, and the "1 point below `main`" rule and the pull request comment do not work yet.
-- `mise run coverage` checks the minimum on your machine, and `mise run check` runs it. The push hook does not; CI checks it on the pull request. The minimum is `LOOM_COVERAGE_MIN` in `mise.toml`. It must stay equal to the ruleset's value.
+- `mise run coverage` checks the minimum on your machine, and `mise run check` runs it. The push hook does not; CI checks it on the pull request. It starts with `cargo llvm-cov clean`, because test binaries that older trees left in a reused target folder would otherwise count as unrun code and lower the total. The minimum is `LOOM_COVERAGE_MIN` in `mise.toml`. It must stay equal to the ruleset's value.
 - The "no more than 1 point below `main`" rule is checked only on GitHub, because it needs the coverage of `main` to compare with. If your change adds code, add tests for it in the same pull request.
 - Code that needs audio or MIDI hardware cannot be reached by tests. Keep it thin, and put the logic it calls where tests can reach it, as the app does with the `devices::Host` trait.
 
