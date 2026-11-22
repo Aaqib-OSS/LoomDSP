@@ -251,7 +251,7 @@ Keys come from what the element shows, not from where it sits:
 
 ## 5. Layers, hit-testing, and who has the input
 
-**Status:** Agreed, phase 2. Rules 5 to 9 are built in phase 3 (plan step 3.1: `layout.rs`, `hit.rs`, `window.rs`, `draw.rs`); no view uses them yet. Rule 12 is built in plan 3.2, row 4a (`layout/scroll.rs`, `window/scroll.rs`); no view uses it yet. Rules 13 to 15 (placement, a press outside, a shadow) are built in plan 3.2, row 3a, for the overlays. Rules 16 and 17 are built in plan 3.2, row 4b (`slider.rs`, `Element::slider`, `Element::checkbox`); no view uses them yet.
+**Status:** Agreed, phase 2. Rules 5 to 9 are built in phase 3 (plan step 3.1: `layout.rs`, `hit.rs`, `window.rs`, `draw.rs`); no view uses them yet. Rule 12 is built in plan 3.2, row 4a (`layout/scroll.rs`, `window/scroll.rs`); no view uses it yet. Rules 13 to 15 (placement, a press outside, a shadow) are built in plan 3.2, row 3a, for the overlays. Rules 16 to 18 are built in plan 3.2, row 4b (`slider.rs`, `select.rs`, `Element::slider`, `Element::checkbox`, `Element::select`); no view uses them yet.
 
 ### Behaviour
 
@@ -347,7 +347,7 @@ The window has four layers, drawn bottom to top: **canvas**, **panels** (toolbar
 
 ## 6. Focus and the keyboard
 
-**Status:** Agreed. Rule 9 is built in plan 3.2, row 4a (`Element::radio_group`, `window/order.rs`, `Runtime::radio_key`); no view uses it yet. Rules 10 and 11 are built in plan 3.2, row 4b (`Runtime::slider_key`, and a check box activated as a switch is); no view uses them yet. Rules 1, 3, and 5 for the canvas and the inspector in phase 1, and rule 8 for the menus over the canvas; the rest in phase 3, for every view. Rule 7 comes with the canvas accessibility spec's outline. For `loom-ui`'s own elements (plan step 3.1): rules 2, 3, and 5, rule 4's fallback when the focused element goes, and rule 7's Ctrl+Tab passing a focused element by are built (`focus.rs`, `window/order.rs`, `Runtime::focus_step`); no view uses them yet. The ring is data until drawing draws it (`Runtime::focus_ring`).
+**Status:** Agreed. Rule 9 is built in plan 3.2, row 4a (`Element::radio_group`, `window/order.rs`, `Runtime::radio_key`); no view uses it yet. Rules 10 to 12 are built in plan 3.2, row 4b (`Runtime::slider_key`, a check box activated as a switch is, and `Runtime::select_key`); no view uses them yet. Rules 1, 3, and 5 for the canvas and the inspector in phase 1, and rule 8 for the menus over the canvas; the rest in phase 3, for every view. Rule 7 comes with the canvas accessibility spec's outline. For `loom-ui`'s own elements (plan step 3.1): rules 2, 3, and 5, rule 4's fallback when the focused element goes, and rule 7's Ctrl+Tab passing a focused element by are built (`focus.rs`, `window/order.rs`, `Runtime::focus_step`); no view uses them yet. The ring is data until drawing draws it (`Runtime::focus_ring`).
 
 ### Rules
 
@@ -433,12 +433,12 @@ The window has four layers, drawn bottom to top: **canvas**, **panels** (toolbar
    - **Closed:** Down, Alt with Down, Enter, and Space open the list with the chosen option highlighted. Up and Home open it on the first option, and End on the last. A printable character opens it on the next option that starts with what has been typed (type-ahead, below).
    - **Open:** Down and Up move the highlight by one and stop at the ends, as the pattern says; Home and End go to the first and last; Page Down and Page Up move by ten options, stopping at the ends. Enter and Space choose the highlighted option and close the list, and so does Alt with Up. Escape closes it with no choice. Tab and Shift+Tab choose the highlighted option, close the list, and move the focus on, as the pattern says, though a native select does not: the pattern does it to match its other comboboxes. Moving the highlight never changes the choice; only these keys and a press on an option do.
    - **A departure from the pattern, with the reason:** in the pattern's example, focus leaving the select by any other path chooses the highlighted option. Here a press outside closes the list with no choice (section 5, rule 18), as a native select and our menus do, since the press is taken and the focus does not leave (rule 14).
-   - **Type-ahead:** printable characters typed within 500 ms of each other build one string, and the highlight goes to the next option whose label starts with it, ignoring case; a single repeated character steps through the options that start with it. Closed, type-ahead opens the list.
+   - **Type-ahead:** printable characters typed within 500 ms of each other build one string, and the highlight goes to the next option whose label starts with it, ignoring case; a single repeated character steps through the options that start with it. Closed, type-ahead opens the list. Space always opens or chooses, even while a string is building, so a label with a space in it is found by what comes before the space; a native select adds the space to the string instead, and the APG example does not say. *Why:* our options' labels are short and differ in their first word, and one meaning for Space is easier to learn.
    - Any other key goes on, as it did before (rule 6). *Why:* the pattern is what keyboard and screen reader users expect, and Iced's pick list took no keys at all. The tile's choice lists are the canvas's and keep their own keys ([panels](panels.md)).
 
 ## 7. The accessibility tree
 
-**Status:** Agreed, phase 1. The node of a text field (rule 10) is built in phase 3. `loom-ui`'s elements give their nodes from plan step 3.1 (`access.rs`, `Context::access_nodes`), checked against rule 2 when they are laid out. Rules 28 and 29 are built in plan 3.2, row 4a, and rules 30 and 31 in row 4b. The stats bar is the first view to give them (plan 3.2, row 1); the app still builds the whole tree and splices them in, until phase 4.
+**Status:** Agreed, phase 1. The node of a text field (rule 10) is built in phase 3. `loom-ui`'s elements give their nodes from plan step 3.1 (`access.rs`, `Context::access_nodes`), checked against rule 2 when they are laid out. Rules 28 and 29 are built in plan 3.2, row 4a, and rules 30 to 32 in row 4b. The stats bar is the first view to give them (plan 3.2, row 1); the app still builds the whole tree and splices them in, until phase 4.
 
 ### Behaviour
 
