@@ -72,6 +72,11 @@ pub(crate) struct Window {
     /// An element to bring into view once the layout is current: the one a
     /// keyboard focus move or a scroll effect named (section 5, rule 12).
     pub(crate) reveal: Option<UiId>,
+    /// A multi-line field, and what of it to bring into view once the
+    /// layout is current (section 8, rule 7): its caret after an edit or a
+    /// caret move, or its start or end after Home or End on a Mac. The last
+    /// request wins.
+    pub(crate) caret_reveal: Option<(UiId, FieldShow)>,
     /// A scroll container moved since the runtime last asked
     /// ([`Window::take_scrolled`]), so what the tree reports changed.
     scrolled: bool,
@@ -198,6 +203,7 @@ impl Default for Window {
             scrolled: false,
             groups: Vec::new(),
             reveal: None,
+            caret_reveal: None,
         }
     }
 }
@@ -390,11 +396,24 @@ impl Window {
                 if let (Some(id), Some(text)) = (&element.id, layout.text(index))
                     && text.field
                 {
+                    // A multi-line field wraps at the width its text was
+                    // measured at, before rounding, so it breaks its lines
+                    // where the layout did.
+                    let lines = if text.wrap {
+                        crate::field::Lines::Many
+                    } else {
+                        crate::field::Lines::One
+                    };
                     seen.push(crate::field::Seen {
                         id: id.clone(),
                         text: text.text.to_owned(),
                         style: text.style,
-                        width: element.content.width,
+                        width: if text.wrap {
+                            element.wrap_width
+                        } else {
+                            element.content.width
+                        },
+                        lines,
                     });
                 }
             }
@@ -714,5 +733,14 @@ impl Window {
 
 mod order;
 pub(crate) mod scroll;
+/// What of a multi-line field the containers around it bring into view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldShow {
+    /// Its caret.
+    Caret,
+    /// Its start or its end.
+    Edge(crate::field::Edge),
+}
+
 #[cfg(test)]
 mod tests;

@@ -873,13 +873,16 @@ impl Layout {
             Kind::Field {
                 text,
                 style: text_style,
+                many,
                 placeholder,
             } => {
+                // A text area wraps to its width, as a wrapping text does, so
+                // it grows with its lines.
                 let leaf = Leaf::Text(TextLeaf {
                     text,
                     spans: Vec::new(),
                     style: text_style,
-                    wrap: false,
+                    wrap: many,
                     colour: None,
                     quiet: false,
                     field: true,
