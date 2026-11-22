@@ -50,7 +50,7 @@
 //! on, so a link that wraps is hit on both lines and nowhere between.
 
 use crate::access::Access;
-use loom_ui_core::{Color, Face, IdKey, Point, Span, TextStyle, UiId, Weight};
+use loom_ui_core::{Color, Face, IdKey, Key, Point, Span, TextStyle, UiId, Weight};
 use std::num::NonZeroU16;
 use std::ops::Range;
 
@@ -455,6 +455,9 @@ pub struct Element {
     /// For a scroll container, the focus stop whose unused scroll keys move
     /// it ([`Element::keys_from`]).
     pub(crate) keys_from: Option<UiId>,
+    /// The stop's unused scroll keys move it ([`Element::scrolls_from`]).
+    pub(crate) scrolls_from_keys: bool,
+    pub(crate) keys_first: Vec<Key>,
     pub(crate) children: Vec<Element>,
     /// Where a root panel goes; `None` fills the window. Only a panel's
     /// root reads it.
@@ -485,6 +488,8 @@ impl Element {
             access: None,
             hover: None,
             keys_from: None,
+            scrolls_from_keys: false,
+            keys_first: Vec::new(),
             children,
             placement: None,
             closes_outside: false,
@@ -638,7 +643,8 @@ impl Element {
     /// stop itself, even with no stop inside, so Tab does not stop twice
     /// for one list. It takes no scroll key itself: the app drives it from
     /// that stop's keys, by moving its highlight and asking for the row
-    /// with `Effects::scroll_into_view`, as the APG combobox pattern does. `stop` must be a focus stop of
+    /// with `Effects::scroll_into_view`, as the APG combobox pattern does.
+    /// [`Element::scrolls_from`] is the other kind. `stop` must be a focus stop of
     /// the panel when it is laid out; a debug build panics when it is not.
     /// Other elements take no keys this way, so a debug build panics on one.
     pub fn keys_from(mut self, stop: UiId) -> Self {
@@ -647,6 +653,19 @@ impl Element {
             return self;
         }
         self.keys_from = Some(stop);
+        self
+    }
+
+    /// For a scroll container, as [`Element::keys_from`], and a scroll key
+    /// the stop `stop` leaves unused also moves it, as it would move a
+    /// container around the stop (ui-layer.md, section 6, rule 6, step 3):
+    /// help's body scrolls from its Close button, which sits above it, so a
+    /// keyboard user can read on without first tabbing to a link (WCAG 2.2,
+    /// SC 2.1.1).
+    #[must_use]
+    pub fn scrolls_from(mut self, stop: UiId) -> Self {
+        self = self.keys_from(stop);
+        self.scrolls_from_keys = self.keys_from.is_some();
         self
     }
 
@@ -932,6 +951,22 @@ impl Element {
     /// Only an element with a key has it.
     pub fn hover_text(mut self, text: impl Into<String>) -> Self {
         self.hover = Some(text.into());
+        self
+    }
+
+    /// Takes `keys` before the focused element inside it (ui-layer.md,
+    /// section 6, rule 6, step 2b): while the focus is on it or inside it,
+    /// a press of one of these keys goes to
+    /// [`App::panel_key`](crate::App::panel_key) with this element's UI ID
+    /// first, and a key the app answers `None` for goes on to the focused
+    /// element as before. A browser's list keys over its search field are
+    /// the case it is for: in WAI-ARIA's combobox, Up and Down move the
+    /// list's highlight and never the caret. The nearest such element
+    /// around the focus that names the key is asked, in the focus's own
+    /// panel. Tab is never taken this way. It needs a key.
+    #[must_use]
+    pub fn takes_first(mut self, keys: impl IntoIterator<Item = Key>) -> Self {
+        self.keys_first = keys.into_iter().filter(|key| *key != Key::Tab).collect();
         self
     }
 

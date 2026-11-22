@@ -525,6 +525,15 @@ impl<A: App, T: Target<A::Message>> Runtime<A, T> {
         changed
     }
 
+    /// After a focus effect: each one may move focus off a field, even one
+    /// that a later effect of the same update moves back, so the field
+    /// leaves at each, and the app hears of it on the next turn.
+    fn field_left_after_focus(&mut self, now: Instant) {
+        let mut later = Vec::new();
+        self.field_left(&mut later, now);
+        self.pending.extend(later);
+    }
+
     /// Moves the runtime's focus to `to`, from the keyboard or an effect,
     /// so a ring shows, and brings it into view (section 5, rule 12).
     /// Returns true when it changed.
@@ -947,6 +956,43 @@ impl<A: App, T: Target<A::Message>> Runtime<A, T> {
         }
     }
 
+    /// A key pressed while the focus is on or inside an element that takes
+    /// it first ([`Element::takes_first`](crate::Element::takes_first)):
+    /// that element's app message, through [`App::panel_key`], before the
+    /// focused element hears the key (section 6, rule 6, step 2b). Only in
+    /// a layer that takes input now. Returns whether the app took the key.
+    fn panel_key(&mut self, event: &Event, batch: &mut Vec<A::Message>) -> bool {
+        let Event::Key(press @ KeyEvent::Pressed { key, .. }) = event else {
+            return false;
+        };
+        // While the canvas has the keyboard, its keys are its own (section
+        // 6, rule 1), as for every other key step of the runtime's.
+        if self.app.input().canvas_focused {
+            return false;
+        }
+        // Escape with a Space held on a button cancels that click first
+        // (section 3, rule 4), so it is left to the activation step.
+        if *key == Key::Escape && self.live_arm().is_some() {
+            return false;
+        }
+        let Some(focused) = self.focus.id() else {
+            return false;
+        };
+        if !self.in_input_layer(focused) {
+            return false;
+        }
+        let Some(owner) = self.panels.takes_first(focused, *key) else {
+            return false;
+        };
+        match self.app.panel_key(owner, press) {
+            Some(message) => {
+                batch.push(message);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The arrows, Space, and Enter on a focused radio of a group (section
     /// 6, rule 9; the WAI-ARIA radio group pattern). Down and Right move to
     /// the next radio and choose it, Up and Left to the one before, both
@@ -1309,6 +1355,9 @@ impl<A: App, T: Target<A::Message>> Runtime<A, T> {
                 let (mut taken, moved) = if composing { (false, false) } else { self.tab(&event) };
                 redraw |= moved;
                 if !taken && !composing {
+                    taken = self.panel_key(&event, &mut batch);
+                }
+                if !taken && !composing {
                     let (activated, changed) = self.activate(&event);
                     taken = activated;
                     redraw |= changed;
@@ -1507,6 +1556,13 @@ impl<A: App, T: Target<A::Message>> Runtime<A, T> {
     /// Keeps the held modifiers from a key event, for Shift during a
     /// slider's drag (section 5, rule 16).
     fn note_modifiers(&mut self, event: &Event) {
+        // What the latest press came from, for a focus effect that follows
+        // it (`Effects::focus_as_input`).
+        match event {
+            Event::Key(KeyEvent::Pressed { .. }) => self.focus.by_key = true,
+            Event::Pointer(loom_ui_core::PointerEvent::Pressed(_)) => self.focus.by_key = false,
+            _ => {}
+        }
         match event {
             Event::Key(KeyEvent::ModifiersChanged(modifiers) | KeyEvent::Pressed { modifiers, .. }) => {
                 self.pointer.modifiers = *modifiers;
@@ -1597,15 +1653,21 @@ impl<A: App, T: Target<A::Message>> Runtime<A, T> {
         let mut redraw = false;
         for effect in effects {
             match effect {
+                Effect::FocusAsInput(id) => {
+                    let quiet = !self.focus.by_key;
+                    redraw |= self.focus_effect(&FocusTarget::Element(id.clone()), Selection::Keep);
+                    if quiet {
+                        if self.focus.id() == Some(&id) {
+                            self.focus.ring = false;
+                        } else if self.focus.wanted.as_ref() == Some(&id) {
+                            self.focus.wanted_quiet = Some(id);
+                        }
+                    }
+                    self.field_left_after_focus(now);
+                }
                 Effect::Focus { target, select } => {
                     redraw |= self.focus_effect(&target, select);
-                    // Each focus effect may move focus off a field, even
-                    // one that a later effect of the same update moves
-                    // back: the field leaves at each, and the app hears of
-                    // it on the next turn.
-                    let mut later = Vec::new();
-                    self.field_left(&mut later, now);
-                    self.pending.extend(later);
+                    self.field_left_after_focus(now);
                 }
                 // The runtime's own element is its own to scroll, once its
                 // layout is current (section 5, rule 12); a toolkit's is

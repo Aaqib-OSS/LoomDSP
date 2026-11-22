@@ -42,7 +42,7 @@
 
 use crate::access::{Access, Problem};
 use crate::element::{Align, Element, Kind, Length, Link, Look, Padding};
-use loom_ui_core::{Color, Point, Rect, Size, Span, TextMeasure, TextStyle, UiId, Vector};
+use loom_ui_core::{Color, Key, Point, Rect, Size, Span, TextMeasure, TextStyle, UiId, Vector};
 use std::collections::HashMap;
 use std::ops::Range;
 use taffy::style_helpers::line;
@@ -197,8 +197,13 @@ pub(crate) struct Record {
     /// For a scroll container, the focus stop whose unused scroll keys move
     /// it (section 5, rule 12).
     pub(crate) keys_from: Option<UiId>,
+    /// The stop's unused scroll keys move it ([`Element::scrolls_from`]).
+    pub(crate) scrolls_from_keys: bool,
     /// For a radio group, a radio, or a radio's mark: which.
     pub(crate) radio: Option<RadioPart>,
+    /// The keys it takes before the focused element inside it
+    /// ([`Element::takes_first`]). Only an element with a UI ID has them.
+    pub(crate) keys_first: Vec<Key>,
     /// For a slider: what it shows and how it moves (section 5, rule 16).
     pub(crate) slider: Option<crate::slider::Slider>,
     /// For a check box's box: whether it is on (section 5, rule 17).
@@ -713,6 +718,20 @@ impl Layout {
         self.by_id.get(id).map(|index| self.records[*index].bounds)
     }
 
+    /// The nearest element on or around the element with UI ID `id` that
+    /// takes `key` before it ([`Element::takes_first`]), in this panel.
+    pub(crate) fn takes_first(&self, id: &UiId, key: Key) -> Option<&UiId> {
+        let mut at = self.by_id.get(id).copied();
+        while let Some(index) = at {
+            let record = &self.records[index];
+            if record.keys_first.contains(&key) {
+                return record.id.as_ref();
+            }
+            at = record.parent;
+        }
+        None
+    }
+
     /// Where the words of the link with UI ID `id` are, one rectangle per
     /// line, in the panel. Empty for any other element.
     pub(crate) fn pieces(&self, id: &UiId) -> &[Rect] {
@@ -870,6 +889,8 @@ impl Layout {
             access,
             hover,
             keys_from,
+            scrolls_from_keys,
+            keys_first,
             children,
             ..
         } = element;
@@ -943,6 +964,7 @@ impl Layout {
         let index = self.records.len();
         let id = key.map(|key| scope.clone().with(key));
         let (kept, lost) = self.claim(id.as_ref(), index, lost);
+        let keys_first = if kept.is_some() { keys_first } else { Vec::new() };
         // A scroll container keeps its offset by its UI ID, so it needs one.
         if (focusable || access.is_some() || scrollbar.is_some()) && id.is_none() {
             self.problem(None, Problem::NoKey);
@@ -972,6 +994,7 @@ impl Layout {
         };
         // Only a container with a UI ID takes its keys from a stop.
         let keys_from = keys_from.filter(|_| kept.is_some());
+        let keys_from_kept = keys_from.is_some();
         self.records.push(Record {
             node,
             parent,
@@ -993,7 +1016,9 @@ impl Layout {
                 most: 0.0,
             }),
             keys_from,
+            scrolls_from_keys: scrolls_from_keys && keys_from_kept,
             radio,
+            keys_first,
             slider,
             check,
             inline: None,
@@ -1096,7 +1121,9 @@ impl Layout {
             clip: None,
             scroll: None,
             keys_from: None,
+            scrolls_from_keys: false,
             radio: None,
+            keys_first: Vec::new(),
             slider: None,
             check: None,
             inline: Some(link.range),
