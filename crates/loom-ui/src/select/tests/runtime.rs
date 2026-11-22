@@ -44,17 +44,49 @@ fn options(variant: u32) -> Vec<String> {
 }
 
 /// A stop, then the select with the app's options and choice; version 5xx
-/// adds nothing and drops the select, so it leaves the layout.
+/// adds nothing and drops the select, so it leaves the layout, and 6xx
+/// shows the first five options with 30 px more above the select.
 fn panel(version: u32, _: Option<&UiId>) -> Vec<(UiId, Layer, Element)> {
     let chosen = Some(version % 100).filter(|at| *at != 99).map(|at| at as usize);
-    if version / 100 == 5 {
+    let variant = version / 100;
+    if variant == 5 {
         return list_panel(Element::column([stop("before")]));
     }
-    let select = Element::select(Select::new("Sample rate", options(version / 100), chosen, SELECT)).key("rate");
+    let options = options(if variant == 6 { 0 } else { variant });
+    let select = Element::select(Select::new("Sample rate", options, chosen, SELECT)).key("rate");
     let after = Element::field("", STYLE)
         .key("after")
         .access(Access::new(Role::TextInput, "After"));
-    list_panel(Element::column([stop("before"), select, after]))
+    let room = Element::space(Length::Shrink, Length::Fixed(if variant == 6 { 30.0 } else { 0.0 }));
+    list_panel(Element::column([stop("before"), room, select, after]))
+}
+
+/// The panel of [`panel`], and an overlay of the app's with a container
+/// 30 px tall at (300, 165), clear of the open list, whose ten rows scroll:
+/// its bar is the 10 px at its right, from x 390.
+fn with_overlay(version: u32, chosen: Option<&UiId>) -> Vec<(UiId, Layer, Element)> {
+    let mut panels = panel(version, chosen);
+    let rows = (0..10).map(|n| Element::text(format!("row {n}"), STYLE)).collect();
+    let container = crate::window::scroll::tests::container("rows", 30.0, rows).width(Length::Fixed(100.0));
+    let overlay = Element::column([container]).placed(crate::element::Placement::At(Point::new(300.0, 165.0)));
+    panels.push((UiId::panel("overlay"), Layer::Overlays, overlay));
+    panels
+}
+
+/// The select alone, in a panel of the Question layer, as in a question.
+fn in_question(version: u32, _: Option<&UiId>) -> Vec<(UiId, Layer, Element)> {
+    let select = Element::select(Select::new(
+        "Sample rate",
+        options(0),
+        Some((version % 100) as usize),
+        SELECT,
+    ))
+    .key("rate");
+    vec![(
+        UiId::panel("list"),
+        Layer::Question,
+        Element::column([stop("before"), select]).width(Length::FILL),
+    )]
 }
 
 /// The same, inside a container 60 px tall with 200 px of space after the
@@ -319,7 +351,7 @@ fn it_closes_on_its_own() {
 fn an_overlay_over_it_closes_it() {
     let mut harness = at_chosen(0);
     step(&mut harness, key(Key::Down));
-    harness.send(Message::Raise);
+    harness.send(Message::Raise(Layer::Overlays));
     step(&mut harness, DriverEvent::Woken);
     assert_eq!(highlight(&harness), None);
     assert!(chosen(&harness).is_empty());
@@ -448,4 +480,122 @@ fn expand_with_the_focus_elsewhere_focuses_the_select() {
     assert_eq!(highlight(&harness), Some(0));
     step(&mut harness, DriverEvent::Woken);
     assert_eq!(highlight(&harness), Some(0), "still open on the next turn");
+}
+
+/// While the list is open, the app may change its choice: the list's tick
+/// follows, and choosing the option chosen before is reported as a choice.
+#[test]
+fn the_list_follows_the_apps_choice() {
+    let mut harness = at_chosen(0);
+    step(&mut harness, key(Key::Down));
+    harness.send(Message::Show(2));
+    step(&mut harness, DriverEvent::Woken);
+    assert_eq!(highlight(&harness), Some(0), "still open");
+    step(&mut harness, key(Key::Enter));
+    assert_eq!(chosen(&harness), [0], "option 0 differs from the app's 2");
+}
+
+/// When its select moves while the list is open, the list moves with it.
+#[test]
+fn the_list_follows_its_select_when_it_moves() {
+    let mut harness = at_chosen(0);
+    step(&mut harness, key(Key::Down));
+    let before = harness.runtime().bounds(&list_id()).expect("the list");
+    harness.send(Message::Show(600));
+    step(&mut harness, DriverEvent::Woken);
+    assert_eq!(highlight(&harness), Some(0), "the same options keep it open");
+    let after = harness.runtime().bounds(&list_id()).expect("the list");
+    assert_eq!(after.y, before.y + 30.0, "under the select where it is now");
+}
+
+/// A select in a question has its list in the Question layer, where the
+/// question's input goes, so a click on an option chooses it.
+#[test]
+fn a_select_in_a_question_has_its_list_there() {
+    let mut harness = at(in_question, 0);
+    harness.send(Message::Raise(Layer::Question));
+    step(&mut harness, DriverEvent::Woken);
+    // A question's focus comes from the app's focus effect, not from Tab.
+    harness.send(Message::Focus(rate()));
+    step(&mut harness, DriverEvent::Woken);
+    assert_eq!(harness.runtime().focused(), Some(&rate()));
+    step(&mut harness, key(Key::Down));
+    assert_eq!(highlight(&harness), Some(0));
+    click(&mut harness, option_point(2));
+    assert_eq!(chosen(&harness), [2]);
+}
+
+/// A press on another overlay's scroll bar while the list is open closes
+/// the list with no choice, and is taken: no drag starts, so moving the
+/// pointer scrolls nothing.
+#[test]
+fn a_press_on_another_bar_closes_the_list_and_drags_nothing() {
+    let mut harness = at(with_overlay, 0);
+    // The overlay's container is a stop of its own, read first, so the
+    // select takes the focus from the app, not from Tab.
+    harness.send(Message::Focus(rate()));
+    step(&mut harness, key(Key::Down));
+    assert_eq!(highlight(&harness), Some(0));
+    let rows = UiId::panel("overlay").with("rows");
+    let on_bar = Point::new(395.0, 170.0);
+    step(
+        &mut harness,
+        pointer(PointerEvent::Pressed(PointerButton::Left), on_bar),
+    );
+    assert_eq!(highlight(&harness), None, "closed");
+    step(&mut harness, pointer(PointerEvent::Moved, Point::new(395.0, 190.0)));
+    step(
+        &mut harness,
+        pointer(PointerEvent::Released(PointerButton::Left), Point::new(395.0, 190.0)),
+    );
+    assert_eq!(
+        harness.runtime().scroll_offset(&rows).expect("the container").0,
+        0.0,
+        "no drag"
+    );
+    assert!(chosen(&harness).is_empty());
+}
+
+/// Expand while the target holds the keys, as an Iced field would, tells
+/// the target to let go before the select takes the focus, so the two
+/// never both hold the keys.
+#[test]
+fn expand_releases_the_targets_focus() {
+    let mut harness = at(panel, 0);
+    harness.parts().1.holds = Some(UiId::panel("iced").with("field"));
+    harness.send(Message::Describe);
+    let nodes = harness.app().nodes.clone().expect("the nodes");
+    let (select, _) = nodes
+        .nodes
+        .iter()
+        .find(|(_, node)| node.label() == Some("Sample rate") && node.role() == accesskit::Role::ComboBox)
+        .cloned()
+        .expect("the select's node");
+    step(
+        &mut harness,
+        DriverEvent::Accessibility(AccessEvent::Action(ActionRequest {
+            action: accesskit::Action::Expand,
+            target_tree: accesskit::TreeId::ROOT,
+            target_node: select,
+            data: None,
+        })),
+    );
+    assert_eq!(harness.runtime().target().released, 1);
+    assert_eq!(harness.runtime().target().holds, None);
+    assert_eq!(harness.runtime().focused(), Some(&rate()));
+    assert_eq!(highlight(&harness), Some(0));
+}
+
+/// Opening the list and moving its highlight each tell the app that what
+/// the tree reports changed, in that turn, so its expanded state and
+/// active descendant reach a screen reader.
+#[test]
+fn opening_and_moving_raise_the_tree_notice() {
+    let mut harness = at_chosen(0);
+    harness.send(Message::CountNotices);
+    let before = harness.app().notices;
+    step(&mut harness, key(Key::Down));
+    assert_eq!(harness.app().notices, before + 1, "opening");
+    step(&mut harness, key(Key::Down));
+    assert_eq!(harness.app().notices, before + 2, "moving the highlight");
 }
