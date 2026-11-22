@@ -1665,6 +1665,16 @@ impl<A: App, T: Target<A::Message>> Runtime<A, T> {
             }
             updates += 1;
             redraw |= self.update(message, now, driver);
+            // A focus an update's effects moved is the next thing the app
+            // hears, before the turn's other messages, as a focus an event
+            // moved is the first (`App::focus_moved`): the app's copy of the
+            // focus is then never behind while it handles one.
+            if !self.exited
+                && let Some(report) = self.panels().focus_report()
+            {
+                updates += 1;
+                redraw |= self.update(report, now, driver);
+            }
         }
         // An overlay an update opened closes a select's list under it, and
         // a list that opened, closed, or moved its highlight changes what
