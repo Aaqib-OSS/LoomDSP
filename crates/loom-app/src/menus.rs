@@ -18,6 +18,8 @@ use loom_ui_core::UiId;
 pub(crate) enum MenuKind {
     /// The menu on a tile, by its module.
     Tile(u32),
+    /// The keyboard cable picker.
+    Cable,
     /// The menu on an output or a cable.
     Probe,
     /// The Recent list.
@@ -137,6 +139,9 @@ impl App {
     /// The open menu, if one is open.
     pub(crate) fn menu_model(&self) -> Option<MenuModel> {
         let highlight = self.overlays.menu_highlight();
+        if let Some((module, start)) = self.overlays.cable_menu() {
+            return Some(self.cable_menu_model(module, start, highlight));
+        }
         if let Some((module, _)) = self.overlays.tile_menu() {
             let id = tile_id(module);
             let title = self
@@ -230,9 +235,11 @@ impl App {
             _ => {
                 if let Some(at) = step(menu.highlight, menu.items.len(), key) {
                     self.overlays.set_menu_highlight(Some(at));
-                    // In a runtime menu the highlight is the focus, with a
-                    // ring, as the keys put it there (row 3b).
-                    if matches!(menu.kind, MenuKind::Probe | MenuKind::Recent) {
+                    if menu.kind == MenuKind::Cable {
+                        self.effect(loom_ui::Effects::scroll_into_view(menu.items[at].id.clone()));
+                    } else if matches!(menu.kind, MenuKind::Probe | MenuKind::Recent) {
+                        // In a runtime menu the highlight is the focus, with a
+                        // ring, as the keys put it there (row 3b).
                         self.effect(loom_ui::Effects::focus(menu.items[at].id.clone()));
                     }
                 }
@@ -243,7 +250,7 @@ impl App {
     /// Closes the open menu of kind `kind`.
     pub(crate) fn close_menu(&mut self, kind: MenuKind) {
         match kind {
-            MenuKind::Tile(_) => self.overlays.close_tile_menu(),
+            MenuKind::Tile(_) | MenuKind::Cable => self.overlays.close_tile_menu(),
             MenuKind::Probe => self.overlays.close_probe_menu(),
             MenuKind::Recent => self.overlays.close_recent_list(),
         }

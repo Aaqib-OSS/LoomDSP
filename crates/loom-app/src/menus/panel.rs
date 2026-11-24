@@ -62,7 +62,7 @@ impl App {
                 Placement::Under(crate::toolbar::toolbar_id().with("recent")),
                 crate::recent::LIST_WIDTH,
             ),
-            MenuKind::Tile(_) => return,
+            MenuKind::Tile(_) | MenuKind::Cable => return,
         };
         let missing: Vec<bool> = match menu.kind {
             MenuKind::Recent => self
