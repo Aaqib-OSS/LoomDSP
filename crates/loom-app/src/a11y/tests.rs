@@ -3801,39 +3801,47 @@ fn the_question_has_focus_over_a_focused_outline_row() {
 }
 
 /// A runtime menu under help or a question is covered: it is not reported,
-/// and a screen reader's Click on one of its items does nothing.
+/// and a screen reader's Click on one of its items does nothing, so the
+/// menu stays open (picking an item would close it). Each menu: the tile
+/// menu, the probe menu, and Recent.
 #[test]
 fn a_covered_runtime_menu_is_not_reported_and_refuses_a_click() {
-    for cover in ["help", "question"] {
-        let (_, mut ui) = with_each_small_overlay()
-            .into_iter()
-            .find(|(name, _)| *name == "probe menu")
-            .unwrap();
-        if cover == "help" {
-            ui.app_mut().overlays.help = Some(crate::help::Help::shortcuts());
-        } else {
-            ui.app_mut().edit(|app| {
-                app.session.controller.add_module("loom.osc.sine").unwrap();
-                app.commit();
-            });
-            ui.send(Message::File(crate::FileAction::New));
-            assert!(ui.app().overlays.question.is_some(), "New asks");
+    for menu in ["tile menu", "probe menu", "recent"] {
+        for cover in ["help", "question"] {
+            let (_, mut ui) = with_each_small_overlay()
+                .into_iter()
+                .find(|(name, _)| *name == menu)
+                .unwrap();
+            let model = ui.app().menu_model().expect("the menu is open");
+            if cover == "help" {
+                ui.app_mut().overlays.help = Some(crate::help::Help::shortcuts());
+            } else {
+                ui.app_mut().edit(|app| {
+                    app.session.controller.add_module("loom.osc.sine").unwrap();
+                    app.commit();
+                });
+                ui.send(Message::File(crate::FileAction::New));
+                assert!(ui.app().overlays.question.is_some(), "New asks");
+            }
+            let _ = ui.redraw();
+            let tree = ui.a11y_tree();
+            assert!(
+                !tree.has_part_under(&model.id),
+                "under {cover}, the {menu} is not in the tree"
+            );
+            let node = node_of(ui.app_mut(), &model.items[0].id);
+            let modules = ui.app().session.controller.graph().nodes().count();
+            ui.send(Message::A11y(Event::Action(request(Action::Click, node, None))));
+            assert!(
+                ui.app().menu_model().is_some(),
+                "under {cover}, the {menu} refused the click and stays open"
+            );
+            assert_eq!(
+                ui.app().session.controller.graph().nodes().count(),
+                modules,
+                "under {cover}, the click on the {menu} changed nothing"
+            );
         }
-        let _ = ui.redraw();
-        let tree = ui.a11y_tree();
-        let meter = crate::menus::probe_id().with("meter");
-        assert!(
-            !tree.has_part_under(&crate::menus::probe_id()),
-            "under {cover}, the probe menu is not in the tree"
-        );
-        let node = node_of(ui.app_mut(), &meter);
-        let modules = ui.app().session.controller.graph().nodes().count();
-        ui.send(Message::A11y(Event::Action(request(Action::Click, node, None))));
-        assert_eq!(
-            ui.app().session.controller.graph().nodes().count(),
-            modules,
-            "under {cover}, the click added no meter"
-        );
     }
 }
 
@@ -3938,6 +3946,9 @@ fn a_menu_opened_by_key_starts_on_its_first_item() {
             by_key,
         }));
         let _ = ui.redraw();
+        // The tile menu is the runtime's (row 3d): its focus is in the
+        // runtime's nodes.
+        ui.read_runtime_nodes();
         let places = ui.places();
         let update = ui.app_mut().a11y_tree(&places);
         let focus = ui.app().a11y.ids.id(update.focus.0).cloned();
@@ -4594,41 +4605,42 @@ fn every_view_sends_nothing_when_nothing_changed() {
     }
 }
 
-/// The licence chooser over Preferences is reported alone: Preferences is
-/// hidden, and its parts do nothing. After Use, Preferences is reported
-/// again with the new default, and has the focus.
+/// The licence chooser over Preferences is reported alone, as a dialog
+/// named by its title with no description: Preferences is not reported,
+/// and its parts do nothing. The focus is on the first question. After
+/// Use, Preferences is reported again with the new default, and has the
+/// focus (patch-metadata.md, Keys).
 #[test]
 fn the_chooser_over_preferences_hides_it_until_it_closes() {
-    use crate::licence_chooser::access::licence_id;
+    use crate::licence_chooser::panel::{button_id, licence_id, question_id};
     use crate::settings::access::preferences_id;
     let mut ui = crate::ui_test::Ui::open("subtractive.ron");
     let _ = ui.app_mut().send(Message::Preferences(crate::settings::Message::Open));
     let _ = ui.redraw();
     let frames = ui.app().a11y_frames();
     assert_eq!(frames.overlay[0].id, preferences_id());
-    let places = ui.places();
-    let _ = ui.app_mut().a11y_tree(&places);
-    let choose = node_of(ui.app_mut(), &preferences_id().with("licence").with("choose"));
-    ui.send(Message::A11y(Event::Action(request(Action::Click, choose, None))));
-    let _ = ui.redraw();
+    ui.a11y_action(&preferences_id().with("licence").with("choose"), Action::Click);
 
     let frames = ui.app().a11y_frames();
-    assert_eq!(frames.overlay.len(), 1);
-    assert_eq!(frames.overlay[0].id, licence_id(), "only the chooser");
-    let places = ui.places();
-    let update = ui.app_mut().a11y_tree(&places);
-    assert_eq!(ui.app().a11y.ids.id(update.focus.0), Some(&licence_id()));
+    assert!(frames.overlay.is_empty(), "Iced reports nothing over it");
+    let tree = ui.a11y_tree();
+    let dialog = tree.node_by_id(&licence_id());
+    assert_eq!(dialog.role(), accesskit::Role::Dialog);
+    assert_eq!(dialog.name(), Some("Default licence for new patches"));
+    assert_eq!(dialog.description(), None, "nothing stands before the first question");
+    assert!(!tree.has_part_under(&preferences_id()), "only the chooser");
+    assert_eq!(
+        tree.focused().ui_id(),
+        Some(&question_id("changes").with("yes")),
+        "the first question has the focus"
+    );
     let activity = node_of(ui.app_mut(), &preferences_id().with("activity"));
     let before = ui.app().rig.store.saved().show_activity;
     ui.send(Message::A11y(Event::Action(request(Action::Click, activity, None))));
     assert_eq!(ui.app().rig.store.saved().show_activity, before, "Preferences is inert");
 
-    for part in [licence_id().with("changes").with("give-up"), licence_id().with("use")] {
-        let places = ui.places();
-        let _ = ui.app_mut().a11y_tree(&places);
-        let target = node_of(ui.app_mut(), &part);
-        ui.send(Message::A11y(Event::Action(request(Action::Click, target, None))));
-        let _ = ui.redraw();
+    for part in [question_id("changes").with("give-up"), button_id("use")] {
+        ui.a11y_action(&part, Action::Click);
     }
     assert!(ui.app().overlays.chooser.is_none(), "Use closed it");
     assert!(ui.app().rig.store.saved().licence.is_some(), "the default is set");
@@ -4636,6 +4648,9 @@ fn the_chooser_over_preferences_hides_it_until_it_closes() {
     assert_eq!(frames.overlay[0].id, preferences_id(), "Preferences is back");
     let places = ui.places();
     let update = ui.app_mut().a11y_tree(&places);
+    // True while Iced draws Preferences (the 2026-11-12 stopgap). Once
+    // Preferences is the runtime's (plan 3.2, the Preferences row), rule 4
+    // gives the focus back to `preferences/licence/choose`: flip this then.
     assert_eq!(
         ui.app().a11y.ids.id(update.focus.0),
         Some(&preferences_id()),
@@ -4651,7 +4666,7 @@ fn the_chooser_over_preferences_hides_it_until_it_closes() {
 /// adds one.
 #[test]
 fn a_licence_from_the_chooser_adds_no_undo_step() {
-    use crate::licence_chooser::access::licence_id;
+    use crate::licence_chooser::panel::{button_id, question_id};
     let mut ui = crate::ui_test::Ui::open("subtractive.ron");
     let before = ui.app().session.document.info().license.clone();
     let steps = ui.app().session.edits.history.len();
@@ -4660,14 +4675,11 @@ fn a_licence_from_the_chooser_adds_no_undo_step() {
         .send(Message::PatchInfo(crate::patch_info::Message::ChooseLicence));
     let _ = ui.redraw();
     for part in [
-        licence_id().with("changes").with("no"),
-        licence_id().with("commercial").with("yes"),
-        licence_id().with("use"),
+        question_id("changes").with("no"),
+        question_id("commercial").with("yes"),
+        button_id("use"),
     ] {
-        let places = ui.places();
-        let _ = ui.app_mut().a11y_tree(&places);
-        let target = node_of(ui.app_mut(), &part);
-        ui.send(Message::A11y(Event::Action(request(Action::Click, target, None))));
+        ui.a11y_action(&part, Action::Click);
     }
     assert_ne!(ui.app().session.document.info().license, before, "the licence is set");
     assert!(ui.app().session.document.info_unsaved());
@@ -4748,42 +4760,36 @@ fn one_change_in_preferences_sends_only_what_changed() {
     );
 }
 
-/// The harness answers a window question after what the same update
-/// posted, as the bridge does: Enter on a menu item, with a screen reader
-/// listening, posts the item's message and asks where the parts are; the
-/// item's message runs first, then the tree reads the window.
+/// A message posted with `App::post` runs on the next turn, before the
+/// window's answer to a question that turn asked, as the bridge orders
+/// them (no nested updates, section 2): a screen reader's Click on the
+/// Outline tab, which Iced still draws, posts the tab's message, and the
+/// tree then asks where the parts are. The posted message comes first.
 #[test]
 fn a_posted_message_runs_before_the_window_answers() {
     let mut ui = crate::ui_test::Ui::open("subtractive.ron");
-    let area = Rect::new(Point::new(0.0, 0.0), Size::new(800.0, 600.0));
-    ui.send(Message::Canvas(CanvasEvent::TileMenu {
-        module: 4,
-        at: Point::new(100.0, 100.0),
-        area,
-        by_key: true,
-    }));
     ui.send(Message::A11y(Event::Activated));
-    ui.app_mut().overlays.set_menu_highlight(Some(0));
-    let item = ui.app().menu_model().expect("the tile menu is open").items[0]
-        .message
-        .clone();
-    let log = ui.deliver(Message::Key(iced::keyboard::Event::KeyPressed {
-        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
-        modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
-        physical_key: iced::keyboard::key::Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified),
-        location: iced::keyboard::Location::Standard,
-        modifiers: iced::keyboard::Modifiers::empty(),
-        text: None,
-        repeat: false,
-    }));
-    let item = format!("{item:?}");
+    let _ = ui.redraw();
+    let places = ui.places();
+    let _ = ui.app_mut().a11y_tree(&places);
+    let tab = node_of(ui.app_mut(), &tree::tab_id(crate::matrix::Tab::Outline));
+    let log = ui.deliver(Message::A11y(Event::Action(request(Action::Click, tab, None))));
+    let item = format!(
+        "{:?}",
+        Message::Matrix(crate::matrix::Event::Tab(crate::matrix::Tab::Outline))
+    );
     let posted = log.iter().position(|message| format!("{message:?}") == item);
     let located = log
         .iter()
         .position(|message| matches!(message, Message::A11y(Event::Located(_))));
     assert!(
         matches!((posted, located), (Some(posted), Some(located)) if posted < located),
-        "the item's message, then the answer: {posted:?}, {located:?}"
+        "the posted message, then the answer: {posted:?}, {located:?}"
+    );
+    assert_eq!(
+        ui.app().right_tab,
+        crate::matrix::Tab::Outline,
+        "the Click chose the tab"
     );
 }
 

@@ -28,10 +28,11 @@ impl App {
         self.toolbar_panel(view);
         self.breadcrumb_panel(view);
         self.bar_panel(view);
-        // Help comes after the browser, so it is over it: F1 opens help
-        // from the browser (help-pages.md).
+        // The browsers, then the chooser, then help, which F1 opens over
+        // any of them (help-pages.md), so help draws over them.
         self.browser_panel(view);
         self.patches_panel(view);
+        self.chooser_panel(view);
         self.help_panel(view);
         self.question_panel(view);
         self.menu_panel(view);
@@ -60,6 +61,7 @@ impl App {
     pub(crate) fn our_stops(&self) -> Vec<UiId> {
         let mut stops = self.question_stops();
         stops.extend(self.help_stops());
+        stops.extend(self.chooser_stops());
         stops.extend(self.browser_stops());
         stops.extend(self.patches_stops());
         stops.extend(self.patches_tags());
@@ -108,6 +110,11 @@ impl App {
         // (patch-metadata.md, Keys; the WAI-ARIA modal dialog and toolbar
         // patterns).
         if let Some(to) = self.patches_next_stop(from, back) {
+            return TabStep::To(to);
+        }
+        // Tab stays inside the licence chooser, wrapping at both ends (the
+        // WAI-ARIA modal dialog pattern; patch-metadata.md, Keys).
+        if let Some(to) = self.chooser_tab(from, next, back) {
             return TabStep::To(to);
         }
         // Tab on a menu item closes the menu and moves on from what opened

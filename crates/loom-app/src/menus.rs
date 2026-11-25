@@ -54,13 +54,6 @@ pub(crate) struct MenuModel {
     pub highlight: Option<usize>,
 }
 
-impl MenuModel {
-    /// The UI ID of the highlighted item.
-    pub(crate) fn highlighted(&self) -> Option<&MenuItem> {
-        self.highlight.and_then(|at| self.items.get(at))
-    }
-}
-
 /// The UI ID of the menu on tile `module`.
 pub(crate) fn tile_id(module: u32) -> UiId {
     UiId::panel("menu").with("tile").with(module)
@@ -225,21 +218,27 @@ impl App {
             Key::Named(Named::Escape) => {
                 self.close_menu(menu.kind);
             }
-            // The item's message is its own update, on the next turn, as a
-            // click on the item would send it (ui-layer.md, section 2, rule 5).
-            Key::Named(Named::Enter) if !repeat => {
-                if let Some(item) = menu.highlighted() {
+            // The cable menu is still Iced's (#856): Enter sends its
+            // highlighted item's message, as its own update on the next turn,
+            // as a click on the item would (ui-layer.md, section 2, rule 5).
+            Key::Named(Named::Enter) if menu.kind == MenuKind::Cable => {
+                if !repeat && let Some(item) = menu.highlight.and_then(|at| menu.items.get(at)) {
                     self.post(item.message.clone());
                 }
             }
+            // In the runtime's menus, Enter and Space on an item are the
+            // runtime's activation (section 3, rule 4), which reaches the app
+            // as `App::clicked`. Here Enter only stops at the menu, with no
+            // item focused.
+            Key::Named(Named::Enter) => {}
             _ => {
                 if let Some(at) = step(menu.highlight, menu.items.len(), key) {
                     self.overlays.set_menu_highlight(Some(at));
                     if menu.kind == MenuKind::Cable {
                         self.effect(loom_ui::Effects::scroll_into_view(menu.items[at].id.clone()));
-                    } else if matches!(menu.kind, MenuKind::Probe | MenuKind::Recent) {
+                    } else {
                         // In a runtime menu the highlight is the focus, with a
-                        // ring, as the keys put it there (row 3b).
+                        // ring, as the keys put it there (rows 3b and 3d).
                         self.effect(loom_ui::Effects::focus(menu.items[at].id.clone()));
                     }
                 }

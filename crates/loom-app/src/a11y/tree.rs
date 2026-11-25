@@ -438,6 +438,9 @@ pub(crate) fn tree(
             frame.covered = covered;
             if let Some((_, node)) = frame.nodes.last_mut().filter(|_| !dialog.is_empty()) {
                 node.set_modal();
+                if let Some(size) = frames.ours_overlay_items {
+                    node.set_size_of_set(size);
+                }
             }
             dialog
         }
@@ -766,6 +769,9 @@ pub(crate) struct Frames {
     /// alert dialog for the question and a menu for the probe menu or
     /// Recent.
     pub ours_overlay: Option<(Role, String, UiId)>,
+    /// How many items the runtime menu in `ours_overlay` holds, for its
+    /// node's set size, so an item in a column still reads as one of all.
+    pub ours_overlay_items: Option<usize>,
     /// A menu the runtime draws inside that overlay, as a panel of its
     /// own: its name and UI ID, around its items. A library row's menu in
     /// the module browser (row 5).
@@ -1082,23 +1088,36 @@ impl Frame<'_> {
             .iter()
             .flat_map(|(_, _, tops)| tops.iter().copied())
             .collect();
-        // The runtime's overlays (the question, row 3b) own the input
-        // while they are open: they are reported and act, while what they
-        // cover is hidden (section 7, rule 27).
+        // The overlay that owns the input (the question, help, the licence
+        // chooser, a menu, a browser) is reported and acts, while what it
+        // covers is hidden (section 7, rule 27). An overlay under it, such
+        // as the chooser under help, is drawn but not reported at all, as a
+        // covered menu is not (rule 24): its nodes would otherwise sit
+        // inside the top one's dialog.
+        let within = |id: &UiId, root: &UiId| id == root || id.is_under(root);
         let overlay_roots: Vec<&UiId> = ours
             .roots
             .iter()
             .filter(|(root, layer, _)| *layer >= loom_ui::Layer::Overlays && owns(root))
             .map(|(root, _, _)| root)
             .collect();
-        let in_overlay = |table: &IdTable, node: NodeId| {
+        let covered_roots: Vec<&UiId> = ours
+            .roots
+            .iter()
+            .filter(|(root, layer, _)| *layer >= loom_ui::Layer::Overlays && !overlay_roots.contains(&root))
+            .map(|(root, _, _)| root)
+            .collect();
+        let in_roots = |table: &IdTable, node: NodeId, roots: &[&UiId]| {
             table
                 .id(node.0)
-                .is_some_and(|id| overlay_roots.iter().any(|root| id == *root || id.is_under(root)))
+                .is_some_and(|id| roots.iter().any(|root| within(id, root)))
         };
         for (id, node) in &ours.nodes {
+            if in_roots(self.table, *id, &covered_roots) {
+                continue;
+            }
             let mut node = node.clone();
-            if self.covered && !in_overlay(self.table, *id) {
+            if self.covered && !in_roots(self.table, *id, &overlay_roots) {
                 node.set_hidden();
             }
             self.nodes.push((*id, node));
@@ -1106,7 +1125,7 @@ impl Frame<'_> {
         let mut overlay: Vec<NodeId> = ours
             .roots
             .iter()
-            .filter(|(root, layer, _)| *layer >= loom_ui::Layer::Overlays && owns(root))
+            .filter(|(root, _, _)| overlay_roots.contains(&root))
             .flat_map(|(_, _, tops)| tops.iter().copied())
             .collect();
         // A menu drawn as a panel of its own is named around its items.

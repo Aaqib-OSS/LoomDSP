@@ -199,6 +199,9 @@ Kept problems survive opening another patch, except as the table says.
 | `OVERLAY_PANEL` | A dialog's box: fill, border, and radius | Matched to the box Iced draws today, measured when the token is built, so the gate shows no change |
 | `MENU_PANEL` | A menu's box over the canvas: the base fill, a 1 px quiet border, radius 6 | As today's probe menu |
 | `MENU_SHADOW` | The shadow under a menu | Black at 35% opacity, offset 4 px down, blur 12 px, as today |
+| `CHOOSER_WIDTH`, `CHOOSER_HEIGHT` | The licence chooser's box: 560 wide, at most 720 high, shorter when the window is; its body scrolls between the title and the buttons | As Iced drew it |
+| `RADIO_SPACING` | The room between the radios of a group | 10 px, more than two focus rings, so no ring touches a neighbour's (ui-layer.md, section 6, rule 9) |
+| `field` (`FieldLook`, `FIELD_PADDING`) | A text field `loom-ui` draws: the base fill, a 1 px border in the strong background colour, radius 2, 5 px inside | As Iced's text field, first used by the licence chooser's Other field (plan 3.2, row 3c) |
 | `BROWSER_FIELD` | A browser's search or Author field: the weak fill and radius 4 (`FIELD_RADIUS`) | As Iced's text input drew it (row 5) |
 | `SWATCH` | The 8 px family swatch beside a module browser row's name, radius 2 (`SWATCH_RADIUS`) | As today (row 5) |
 | `TAG` | A Your patches tag: a 1 px outline (`TAG_BORDER`) and radius 4 (`TAG_RADIUS`); filled and outlined while it filters, quiet text otherwise | As the tab look Iced drew (row 5b) |

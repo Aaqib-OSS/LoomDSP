@@ -664,9 +664,12 @@ impl Widget<Message, iced::Theme, crate::Renderer> for Injector<'_> {
                     }
                     continue;
                 }
-                // Tab from a script inside help moves among help's stops, as
-                // the runtime's Tab does (row 6); Iced never hears it.
-                if self.app.overlays.help.is_some()
+                // Tab from a script inside help or the licence chooser moves
+                // among its stops, as the runtime's Tab does (rows 6 and 3c);
+                // Iced never hears it. Only until scripted keys take the
+                // runtime's path (lane C's 1b).
+                if (self.app.overlays.help.is_some()
+                    || self.app.input_owner() == crate::input_owner::InputOwner::Chooser)
                     && self.app.overlays.question.is_none()
                     && let Event::Keyboard(keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(keyboard::key::Named::Tab),
@@ -674,7 +677,7 @@ impl Widget<Message, iced::Theme, crate::Renderer> for Injector<'_> {
                         ..
                     }) = &injected
                 {
-                    shell.publish(Message::HelpTab {
+                    shell.publish(Message::OverlayTab {
                         back: modifiers.shift(),
                     });
                     continue;

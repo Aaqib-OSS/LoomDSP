@@ -11,7 +11,6 @@
 use crate::App;
 use crate::a11y::items::{Item, Kind};
 use crate::input_owner::InputOwner;
-use crate::menus::MenuModel;
 use loom_ui_core::UiId;
 
 /// The UI ID of the open question.
@@ -41,17 +40,23 @@ impl App {
             InputOwner::Question => (Vec::new(), None),
             // Help is the runtime's (row 6): its nodes come from its panel.
             InputOwner::Help => (Vec::new(), None),
-            // The probe menu and Recent are the runtime's (row 3b).
-            InputOwner::ProbeMenu | InputOwner::RecentList => (Vec::new(), None),
-            InputOwner::TileMenu => match self.menu_model() {
-                Some(menu) => {
-                    let focus = menu
-                        .highlighted()
-                        .map_or_else(|| menu.id.clone(), |item| item.id.clone());
-                    (vec![menu_item(&menu)], Some(focus))
+            // The menus are the runtime's (rows 3b and 3d), except the cable
+            // menu, which Iced still draws (#856): its items come from here.
+            InputOwner::TileMenu | InputOwner::ProbeMenu | InputOwner::RecentList => {
+                match self
+                    .menu_model()
+                    .filter(|menu| menu.kind == crate::menus::MenuKind::Cable)
+                {
+                    Some(menu) => {
+                        let focus = menu
+                            .highlight
+                            .and_then(|at| menu.items.get(at))
+                            .map_or_else(|| menu.id.clone(), |item| item.id.clone());
+                        (vec![menu_item(&menu)], Some(focus))
+                    }
+                    None => (Vec::new(), None),
                 }
-                None => (Vec::new(), None),
-            },
+            }
             // The module browser is the runtime's (row 5): its nodes come
             // from its panels, and its focus is the runtime's search field.
             InputOwner::Browser => (Vec::new(), None),
@@ -67,21 +72,16 @@ impl App {
                 ),
                 None => (Vec::new(), None),
             },
-            InputOwner::Chooser => match &self.overlays.chooser {
-                Some(open) => (
-                    vec![crate::licence_chooser::access::items(&open.model())],
-                    Some(crate::licence_chooser::access::licence_id()),
-                ),
-                None => (Vec::new(), None),
-            },
+            // The licence chooser is the runtime's (row 3c).
+            InputOwner::Chooser => (Vec::new(), None),
             InputOwner::Canvas => (Vec::new(), None),
         }
     }
 }
 
-/// A menu and its items. The highlighted item is reported as focus, not
-/// as a state of its own.
-fn menu_item(menu: &MenuModel) -> Item {
+/// The cable menu and its items, which Iced still draws (#856). The
+/// highlighted item is reported as focus, not as a state of its own.
+fn menu_item(menu: &crate::menus::MenuModel) -> Item {
     let items = menu
         .items
         .iter()

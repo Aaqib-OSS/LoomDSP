@@ -23,6 +23,9 @@ impl App {
         }
         // One arm per field, added with its view: `id == &view::field_id()`
         // then `view::field_message(event)`.
+        if *id == crate::licence_chooser::panel::other_text_id() {
+            return crate::licence_chooser::field_message(event);
+        }
         if *id == crate::browser::search_id() {
             return crate::browser::field_message(event);
         }

@@ -522,11 +522,12 @@ enum Message {
     MenuTab {
         back: bool,
     },
-    /// Tab or Shift+Tab inside help: the focus moves to help's next stop,
-    /// or the one before, wrapping at both ends (the WAI-ARIA modal dialog
-    /// pattern; row 6). One message whether the key came from the keyboard
-    /// or a script.
-    HelpTab {
+    /// Tab or Shift+Tab from a script inside help or the licence chooser:
+    /// the focus moves to that overlay's next stop, or the one before,
+    /// wrapping at both ends, as the runtime's own Tab does (the WAI-ARIA
+    /// modal dialog pattern; rows 6 and 3c). Only until scripted keys take
+    /// the runtime's path (lane C's 1b).
+    OverlayTab {
         back: bool,
     },
     /// One step of the runtime's focus, after a menu closed and gave back
@@ -867,7 +868,7 @@ impl Message {
             | Self::EnterFields { .. }
             | Self::ToolbarFocus(_)
             | Self::MenuTab { .. }
-            | Self::HelpTab { .. }
+            | Self::OverlayTab { .. }
             | Self::FocusStep { .. }
             | Self::SliderReleased
             | Self::Matrix(_)
@@ -1832,6 +1833,7 @@ impl App {
         }
         let was_open = self.overlays.browser().is_some();
         let was_help_open = self.overlays.help.is_some();
+        let was_chooser_open = self.overlays.chooser.is_some();
         let before_help = self.input_owner();
         match message {
             Message::Browser(message) => self.browser_message(message),
@@ -1889,8 +1891,13 @@ impl App {
                 }
             }
             Message::FocusStep { back } => self.effect(loom_ui::Effects::focus_step(back)),
-            Message::HelpTab { back } => {
-                if let Some(next) = self.help_next_stop(self.focus.as_ref(), back) {
+            Message::OverlayTab { back } => {
+                let next = if self.overlays.help.is_some() {
+                    self.help_next_stop(self.focus.as_ref(), back)
+                } else {
+                    self.chooser_next_stop(self.focus.as_ref(), back)
+                };
+                if let Some(next) = next {
                     self.effect(loom_ui::Effects::focus(next));
                 }
             }
@@ -2004,7 +2011,7 @@ impl App {
         } else if !was_help_open && self.overlays.help.is_some() {
             if matches!(
                 before_help,
-                input_owner::InputOwner::Browser | input_owner::InputOwner::Patches
+                input_owner::InputOwner::Browser | input_owner::InputOwner::Patches | input_owner::InputOwner::Chooser
             ) {
                 self.overlays.help_focus = self.focus.clone();
                 if self.overlays.help_focus.is_some() {
@@ -2024,9 +2031,11 @@ impl App {
                 .filter(|field| match owner {
                     input_owner::InputOwner::Browser => *field == browser::search_id(),
                     input_owner::InputOwner::Patches => patches::text_fields().contains(field),
+                    input_owner::InputOwner::Chooser => self.chooser_stops().contains(field),
                     _ => false,
                 })
-                .or_else(|| (owner == input_owner::InputOwner::Browser).then(browser::search_id));
+                .or_else(|| (owner == input_owner::InputOwner::Browser).then(browser::search_id))
+                .or_else(|| self.overlays.chooser.as_ref().map(licence_chooser::Chooser::first_stop));
             if let Some(field) = field {
                 self.effect(loom_ui::Effects::focus(field));
             } else if self
@@ -2036,6 +2045,10 @@ impl App {
             {
                 self.effect(loom_ui::Effects::unfocus());
             }
+        } else if !was_chooser_open && self.overlays.chooser.is_some() {
+            self.chooser_opened();
+        } else if was_chooser_open && self.overlays.chooser.is_none() {
+            self.chooser_closed();
         } else if !was_open && self.overlays.browser().is_some() {
             self.effect(loom_ui::Effects::focus(browser::search_id()));
         }
@@ -2225,7 +2238,7 @@ impl App {
             | Message::EnterFields { .. }
             | Message::ToolbarFocus(_)
             | Message::MenuTab { .. }
-            | Message::HelpTab { .. }
+            | Message::OverlayTab { .. }
             | Message::FocusStep { .. }
             | Message::FocusMoved(_)
             | Message::Inspector(_)

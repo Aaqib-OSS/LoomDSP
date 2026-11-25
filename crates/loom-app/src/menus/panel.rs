@@ -2,7 +2,9 @@
 //! (ui-layer.md, section 6, rule 8; plan 3.2, row 3b): placed where they
 //! were asked for, closing on a press outside, with the menu shadow. Their
 //! items are menu items and focus stops, and the menu's highlight is the
-//! runtime's focus on an item. The tile menu stays Iced's for now.
+//! runtime's focus on an item. The tile menu is one too (row 3d): placed
+//! at the tile's top-left corner from the keyboard, or where the pointer
+//! pressed.
 
 use super::{MenuKind, MenuModel};
 use crate::style;
@@ -12,11 +14,21 @@ use loom_ui::access::{Access, Action, Role};
 use loom_ui::{Element, Layer, Length, Placement, View};
 use loom_ui_core::{Color, IdKey, UiId};
 
+/// The width of the tile menu, in logical pixels: its items' 200 and the
+/// menu's padding, as Iced drew it.
+const TILE_MENU_WIDTH: f32 = 208.0;
+
 /// One item as the menu's panel shows it.
 #[derive(Debug, Clone, PartialEq)]
 struct Item {
-    /// Its key in the menu: the last key of its UI ID.
-    key: IdKey,
+    /// Its keys under the menu's UI ID: one for most items, more for
+    /// one such as `make-slot/<role>` (ui-layer.md, section 4), so the
+    /// element the runtime lays out has the item's own UI ID.
+    path: Vec<IdKey>,
+    /// Its place in the menu, from 0, in the model's order: a row inside a
+    /// column says it, so a screen reader counts it among all the items,
+    /// not among the column's.
+    position: usize,
     /// What it says.
     label: String,
     /// A second, quiet line under it: a Recent file's folder.
@@ -62,7 +74,11 @@ impl App {
                 Placement::Under(crate::toolbar::toolbar_id().with("recent")),
                 crate::recent::LIST_WIDTH,
             ),
-            MenuKind::Tile(_) | MenuKind::Cable => return,
+            MenuKind::Tile(_) => match self.overlays.tile_menu() {
+                Some((_, at)) => (Placement::At(at), TILE_MENU_WIDTH),
+                None => return,
+            },
+            MenuKind::Cable => return,
         };
         let missing: Vec<bool> = match menu.kind {
             MenuKind::Recent => self
@@ -80,7 +96,8 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(at, item)| Item {
-                    key: item.id.keys().last().cloned().expect("an item's UI ID has keys"),
+                    path: item.id.keys()[menu.id.keys().len()..].to_vec(),
+                    position: at,
                     label: item.label.clone(),
                     second: item.description.clone(),
                     dim: missing.get(at).copied().unwrap_or(false),
@@ -96,18 +113,21 @@ impl App {
         view.panel_with(menu.id, Layer::Overlays, &panel, build);
     }
 
-    /// The open menu the runtime draws: the probe menu or Recent, not the
-    /// tile menu, which Iced still draws.
+    /// The open menu: the tile menu, the probe menu, or Recent, each the
+    /// runtime's.
     pub(crate) fn runtime_menu(&self) -> Option<MenuModel> {
         // Only while it owns the input: under Help or a question it is
         // covered, so it is neither drawn nor reported, and refuses a
         // screen reader's actions (section 7, rule 24).
         let owns = matches!(
             self.overlays.owner(),
-            crate::input_owner::InputOwner::ProbeMenu | crate::input_owner::InputOwner::RecentList
+            crate::input_owner::InputOwner::ProbeMenu
+                | crate::input_owner::InputOwner::RecentList
+                | crate::input_owner::InputOwner::TileMenu
         );
-        self.menu_model()
-            .filter(|menu| owns && matches!(menu.kind, MenuKind::Probe | MenuKind::Recent))
+        // The cable menu shares the tile menu's owner, but is still Iced's
+        // (#856), so it is no runtime menu.
+        self.menu_model().filter(|menu| owns && menu.kind != MenuKind::Cable)
     }
 
     /// The message for a click on one of the runtime menu's items, from the
@@ -127,6 +147,12 @@ impl App {
             Some(Message::ProbeMenu(crate::probe_menu::Message::Close))
         } else if *root == super::recent_id() {
             Some(Message::Recent(crate::recent::Message::Close))
+        } else if self
+            .overlays
+            .tile_menu()
+            .is_some_and(|(module, _)| *root == super::tile_id(module))
+        {
+            Some(Message::CloseTileMenu)
         } else {
             None
         }
@@ -137,6 +163,7 @@ impl App {
     pub(crate) fn runtime_overlay_open(&self) -> bool {
         self.overlays.question.is_some()
             || self.overlays.help.is_some()
+            || self.overlays.chooser.is_some()
             || self.runtime_menu().is_some()
             || self.overlays.browser().is_some()
             || self.overlays.patches().is_some()
@@ -153,7 +180,12 @@ impl App {
 /// The menu: a column of items in a box with the menu shadow, placed, and
 /// closing on a press outside.
 fn build(panel: &Panel) -> Element {
-    Element::column(panel.items.iter().map(|item| row(panel, item)))
+    let items: Vec<&Item> = panel.items.iter().collect();
+    debug_assert!(
+        keys_grouped(&items),
+        "a menu's items keep each shared key together, and no item is a prefix of another"
+    );
+    Element::column(rows(panel, &items, 0))
         .padding(4.0)
         .width(Length::Fixed(panel.width))
         .background(panel.fill)
@@ -164,11 +196,67 @@ fn build(panel: &Panel) -> Element {
         .closes_on_press_outside()
 }
 
+/// True when `rows` can key every row with its whole UI ID and no two
+/// columns share one: the items with a shared leading run of keys sit next
+/// to each other, and no item's keys begin another's. The menus' own order
+/// gives this (the make-slot items, then each slot's swaps, by kind), and
+/// a debug build checks it.
+fn keys_grouped(items: &[&Item]) -> bool {
+    for (at, item) in items.iter().enumerate() {
+        for other in &items[at + 1..] {
+            let shorter = item.path.len().min(other.path.len());
+            if item.path[..shorter] == other.path[..shorter] {
+                return false;
+            }
+        }
+        for depth in 1..item.path.len() {
+            let prefix = &item.path[..depth];
+            let has = |other: &&Item| other.path.len() > depth && other.path[..depth] == *prefix;
+            let first = items.iter().position(has).unwrap_or(at);
+            let last = items.iter().rposition(has).unwrap_or(at);
+            if !items[first..=last].iter().all(has) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The rows of `items`, in order, keyed by their keys from `depth` on:
+/// items next to each other whose IDs share the key at `depth` go in a
+/// column keyed by it, so a row's UI ID is its item's whole ID.
+fn rows(panel: &Panel, items: &[&Item], depth: usize) -> Vec<Element> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < items.len() {
+        let item = items[at];
+        if item.path.len() == depth + 1 {
+            out.push(row(panel, item, item.path[depth].clone()));
+            at += 1;
+            continue;
+        }
+        let key = &item.path[depth];
+        let group = items[at..]
+            .iter()
+            .take_while(|other| other.path.len() > depth + 1 && other.path[depth] == *key)
+            .count();
+        out.push(
+            Element::column(rows(panel, &items[at..at + group], depth + 1))
+                .width(Length::FILL)
+                .key(key.clone()),
+        );
+        at += group;
+    }
+    out
+}
+
 /// One item: its label, and a quiet second line where it has one.
-fn row(panel: &Panel, item: &Item) -> Element {
+fn row(panel: &Panel, item: &Item, key: IdKey) -> Element {
     let label_colour = if item.dim { style::QUIET.to_core() } else { panel.text };
     let mut lines = vec![Element::text(item.label.clone(), style::CONTROL_TEXT).colour(label_colour)];
-    let mut access = Access::new(Role::MenuItem, item.label.clone()).action(Action::Click);
+    let mut access = Access::new(Role::MenuItem, item.label.clone())
+        .action(Action::Click)
+        .position_in_set(item.position);
     if let Some(second) = &item.second {
         lines.push(Element::text(second.clone(), style::BODY_TEXT).colour(style::QUIET.to_core()));
         access = access.description(second.clone());
@@ -192,7 +280,10 @@ fn row(panel: &Panel, item: &Item) -> Element {
             pressed: hovered,
             off: loom_ui::StateLook::default(),
         })
-        .key(item.key.clone())
+        .key(key)
         .focusable()
         .access(access)
 }
+
+#[cfg(test)]
+mod tests;
