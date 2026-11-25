@@ -362,6 +362,8 @@ pub enum Placement {
     /// Under the element with this UI ID, in another panel, its left edge
     /// at that element's, read from the layout already made.
     Under(UiId),
+    /// Centred in the window, for a panel that belongs to no one place.
+    Centred,
 }
 
 /// A link inside a rich text: the bytes of the text it covers, and what
@@ -454,6 +456,8 @@ pub struct Element {
     pub(crate) opaque: bool,
     pub(crate) look: Look,
     pub(crate) focusable: bool,
+    /// A focus stop while turned off too ([`Element::focusable_while_off`]).
+    pub(crate) focusable_while_off: bool,
     pub(crate) access: Option<Access>,
     pub(crate) hover: Option<String>,
     /// For a scroll container, the focus stop whose unused scroll keys move
@@ -497,6 +501,7 @@ impl Element {
             opaque: false,
             look: Look::default(),
             focusable: false,
+            focusable_while_off: false,
             access: None,
             hover: None,
             keys_from: None,
@@ -1069,6 +1074,17 @@ impl Element {
     /// In a debug build, when the panel is laid out, if it has no key.
     pub fn focusable(mut self) -> Self {
         self.focusable = true;
+        self
+    }
+
+    /// As [`Element::focusable`], and still a focus stop while its node is
+    /// turned off, for a menu item only (ui-layer.md, section 6, rule 2;
+    /// the APG's "Focusability of disabled controls"): its node says it is
+    /// off and offers Focus alone, and Enter, Space, and a click do
+    /// nothing. Any other role is skipped while off, as before.
+    pub fn focusable_while_off(mut self) -> Self {
+        self.focusable = true;
+        self.focusable_while_off = true;
         self
     }
 

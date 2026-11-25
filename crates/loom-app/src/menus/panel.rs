@@ -4,7 +4,9 @@
 //! items are menu items and focus stops, and the menu's highlight is the
 //! runtime's focus on an item. The tile menu is one too (row 3d): placed
 //! at the tile's top-left corner from the keyboard, or where the pointer
-//! pressed.
+//! pressed. So is the cable picker: centred in the window, with its name
+//! as a heading over a scrolling list, closing on a press outside as
+//! the others do.
 
 use super::{MenuKind, MenuModel};
 use crate::style;
@@ -12,11 +14,22 @@ use crate::{App, Message};
 use loom_canvas::iced_convert::ToCore as _;
 use loom_ui::access::{Access, Action, Role};
 use loom_ui::{Element, Layer, Length, Placement, View};
-use loom_ui_core::{Color, IdKey, UiId};
+use loom_ui_core::{Color, IdKey, Key, KeyEvent, UiId};
 
 /// The width of the tile menu, in logical pixels: its items' 200 and the
 /// menu's padding, as Iced drew it.
 const TILE_MENU_WIDTH: f32 = 208.0;
+
+/// The width of the cable picker, in logical pixels, as Iced drew it.
+const CABLE_MENU_WIDTH: f32 = 270.0;
+
+/// The most height the cable picker takes, in logical pixels, as Iced drew
+/// it: a longer list scrolls inside it.
+const CABLE_MENU_HEIGHT: f32 = 350.0;
+
+/// How many rows Page Up and Page Down move in the cable picker: about as
+/// many as its box shows, as the module browser's list moves by its own.
+const CABLE_PAGE_ROWS: usize = 10;
 
 /// One item as the menu's panel shows it.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +48,8 @@ struct Item {
     second: Option<String>,
     /// Shown dimmed: a Recent file that was not there.
     dim: bool,
+    /// Turned off: it picks nothing, and keeps the focus (rule 2).
+    off: bool,
     /// The menu's highlighted item, which is its focused one: the weak
     /// fill, whether the pointer or the keys put it there (Brylie's
     /// decision, 2026-11-20), with the focus ring on top from the keys.
@@ -47,8 +62,11 @@ struct Item {
 pub(crate) struct Panel {
     /// Its items, in order.
     items: Vec<Item>,
-    /// Where it goes.
-    placement: Placement,
+    /// Where it goes: placed, or `None` for centred in the window, with
+    /// its heading over a scrolling list (the cable picker).
+    placement: Option<Placement>,
+    /// Its name over its items, in a centred menu.
+    heading: Option<String>,
     /// How wide it is.
     width: f32,
     /// Its fill.
@@ -67,18 +85,26 @@ impl App {
         };
         let (placement, width) = match menu.kind {
             MenuKind::Probe => match self.overlays.probe_menu() {
-                Some(probe) => (Placement::At(probe.at()), crate::probe_menu::WIDTH),
+                Some(probe) => (Some(Placement::At(probe.at())), crate::probe_menu::WIDTH),
                 None => return,
             },
             MenuKind::Recent => (
-                Placement::Under(crate::toolbar::toolbar_id().with("recent")),
+                Some(Placement::Under(crate::toolbar::toolbar_id().with("recent"))),
                 crate::recent::LIST_WIDTH,
             ),
             MenuKind::Tile(_) => match self.overlays.tile_menu() {
-                Some((_, at)) => (Placement::At(at), TILE_MENU_WIDTH),
+                Some((_, at)) => (Some(Placement::At(at)), TILE_MENU_WIDTH),
                 None => return,
             },
-            MenuKind::Cable => return,
+            // Centred, not anchored: it opens from a tile by a key and
+            // lists ports from across the level.
+            MenuKind::Cable => (None, CABLE_MENU_WIDTH),
+        };
+        // The cable picker's rows are keyed under its list, which keeps
+        // the scroll's offset.
+        let base = match menu.kind {
+            MenuKind::Cable => crate::cable_picker::list_id(),
+            _ => menu.id.clone(),
         };
         let missing: Vec<bool> = match menu.kind {
             MenuKind::Recent => self
@@ -96,14 +122,16 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(at, item)| Item {
-                    path: item.id.keys()[menu.id.keys().len()..].to_vec(),
+                    path: item.id.keys()[base.keys().len()..].to_vec(),
                     position: at,
                     label: item.label.clone(),
                     second: item.description.clone(),
                     dim: missing.get(at).copied().unwrap_or(false),
+                    off: item.message.is_none(),
                     highlighted: menu.highlight == Some(at),
                 })
                 .collect(),
+            heading: placement.is_none().then(|| menu.label.clone()),
             placement,
             width,
             fill: palette.background.base.color.to_core(),
@@ -125,19 +153,18 @@ impl App {
                 | crate::input_owner::InputOwner::RecentList
                 | crate::input_owner::InputOwner::TileMenu
         );
-        // The cable menu shares the tile menu's owner, but is still Iced's
-        // (#856), so it is no runtime menu.
-        self.menu_model().filter(|menu| owns && menu.kind != MenuKind::Cable)
+        // The cable picker shares the tile menu's owner.
+        self.menu_model().filter(|_| owns)
     }
 
     /// The message for a click on one of the runtime menu's items, from the
     /// pointer, Enter or Space, or a screen reader: what picking it sends.
     pub(crate) fn menu_click(&self, id: &UiId) -> Option<Message> {
-        self.runtime_menu()?
-            .items
+        let menu = self.runtime_menu()?;
+        menu.items
             .into_iter()
             .find(|item| item.id == *id)
-            .map(|item| item.message)
+            .and_then(|item| item.message)
     }
 
     /// The message for a press outside the runtime menu `root`: close it
@@ -147,15 +174,53 @@ impl App {
             Some(Message::ProbeMenu(crate::probe_menu::Message::Close))
         } else if *root == super::recent_id() {
             Some(Message::Recent(crate::recent::Message::Close))
-        } else if self
-            .overlays
-            .tile_menu()
-            .is_some_and(|(module, _)| *root == super::tile_id(module))
+        } else if *root == crate::cable_picker::cable_id()
+            || self
+                .overlays
+                .tile_menu()
+                .is_some_and(|(module, _)| *root == super::tile_id(module))
         {
             Some(Message::CloseTileMenu)
         } else {
             None
         }
+    }
+
+    /// The message for Up, Down, Home, End, Page Up, or Page Down inside
+    /// the cable picker's list, which takes them before its scroll would:
+    /// the focus moves to the next item, the one before, the first, or the
+    /// last, as on any menu, or a page on, stopping at the ends, as the
+    /// module browser's list does (section 6, rule 8). `None` for any
+    /// other element or key.
+    pub(crate) fn menu_panel_key(&self, id: &UiId, key: &KeyEvent) -> Option<Message> {
+        let menu = self.runtime_menu().filter(|menu| menu.kind == MenuKind::Cable)?;
+        let KeyEvent::Pressed { key, .. } = key else {
+            return None;
+        };
+        if *id != crate::cable_picker::list_id() {
+            return None;
+        }
+        let last = menu.items.len().checked_sub(1)?;
+        let at = menu.highlight.unwrap_or(0);
+        let named = match key {
+            Key::PageUp => {
+                return Some(Message::MenuMove {
+                    to: at.saturating_sub(CABLE_PAGE_ROWS),
+                });
+            }
+            Key::PageDown => {
+                return Some(Message::MenuMove {
+                    to: (at + CABLE_PAGE_ROWS).min(last),
+                });
+            }
+            Key::Up => iced::keyboard::key::Named::ArrowUp,
+            Key::Down => iced::keyboard::key::Named::ArrowDown,
+            Key::Home => iced::keyboard::key::Named::Home,
+            Key::End => iced::keyboard::key::Named::End,
+            _ => return None,
+        };
+        let to = super::step(menu.highlight, menu.items.len(), &iced::keyboard::Key::Named(named))?;
+        Some(Message::MenuMove { to })
     }
 
     /// True while one of the runtime's overlays owns the input: the
@@ -179,13 +244,17 @@ impl App {
 }
 
 /// The menu: a column of items in a box with the menu shadow, placed, and
-/// closing on a press outside.
+/// closing on a press outside. The cable picker's box is centred, with its
+/// heading over its rows in a scroll.
 fn build(panel: &Panel) -> Element {
     let items: Vec<&Item> = panel.items.iter().collect();
     debug_assert!(
         keys_grouped(&items),
         "a menu's items keep each shared key together, and no item is a prefix of another"
     );
+    let Some(placement) = &panel.placement else {
+        return centred(panel, &items);
+    };
     Element::column(rows(panel, &items, 0))
         .padding(4.0)
         .width(Length::Fixed(panel.width))
@@ -193,7 +262,41 @@ fn build(panel: &Panel) -> Element {
         .border(style::MENU_BORDER, style::QUIET.to_core())
         .radius(style::MENU_RADIUS)
         .shadow(style::MENU_SHADOW)
-        .placed(panel.placement.clone())
+        .placed(placement.clone())
+        .closes_on_press_outside()
+}
+
+/// The cable picker: its heading, then its rows in a scroll keyed `list`,
+/// in a box centred in the window (ui-layer.md, section 5, rule 13),
+/// closing on a press outside it with either button (rule 14). The heading
+/// gives no node: the menu is named by the same text, and a menu holds only
+/// its items (the WAI-ARIA menu pattern).
+fn centred(panel: &Panel, items: &[&Item]) -> Element {
+    let heading = panel.heading.clone().unwrap_or_default();
+    let list = Element::scroll(
+        Element::column(rows(panel, items, 0)).spacing(2.0).width(Length::FILL),
+        style::scroll(),
+    )
+    .key("list")
+    // Its own arrows would scroll it; in a menu they move the focus among
+    // the items, so the list asks the app first (section 6, rule 6, step
+    // 2b; the WAI-ARIA menu pattern).
+    .takes_first([Key::Up, Key::Down, Key::Home, Key::End, Key::PageUp, Key::PageDown])
+    .height(Length::FILL)
+    .min_height(0.0)
+    .width(Length::FILL);
+    Element::column([Element::text(heading, style::HEADING_TEXT).colour(panel.text), list])
+        .spacing(6.0)
+        .padding(8.0)
+        .width(Length::Fixed(panel.width))
+        .max_height(CABLE_MENU_HEIGHT)
+        .min_height(0.0)
+        .background(panel.fill)
+        .border(style::MENU_BORDER, style::QUIET.to_core())
+        .radius(style::MENU_RADIUS)
+        .shadow(style::MENU_SHADOW)
+        .opaque()
+        .placed(Placement::Centred)
         .closes_on_press_outside()
 }
 
@@ -253,11 +356,24 @@ fn rows(panel: &Panel, items: &[&Item], depth: usize) -> Vec<Element> {
 
 /// One item: its label, and a quiet second line where it has one.
 fn row(panel: &Panel, item: &Item, key: IdKey) -> Element {
-    let label_colour = if item.dim { style::QUIET.to_core() } else { panel.text };
-    let mut lines = vec![Element::text(item.label.clone(), style::CONTROL_TEXT).colour(label_colour)];
+    let label = Element::text(item.label.clone(), style::CONTROL_TEXT);
+    // A turned-off item takes its text colour from its off look, the plain
+    // role's, as a turned-off control in Preferences does.
+    let label = match (item.off, item.dim) {
+        (true, _) => label,
+        (false, true) => label.colour(style::QUIET.to_core()),
+        (false, false) => label.colour(panel.text),
+    };
+    let mut lines = vec![label];
     let mut access = Access::new(Role::MenuItem, item.label.clone())
         .action(Action::Click)
         .position_in_set(item.position);
+    if item.off {
+        access = access.states(loom_ui::access::States {
+            disabled: true,
+            ..loom_ui::access::States::default()
+        });
+    }
     if let Some(second) = &item.second {
         lines.push(Element::text(second.clone(), style::BODY_TEXT).colour(style::QUIET.to_core()));
         access = access.description(second.clone());
@@ -270,7 +386,7 @@ fn row(panel: &Panel, item: &Item, key: IdKey) -> Element {
         background: item.highlighted.then_some(panel.hover),
         text: None,
     };
-    Element::column(lines)
+    let row = Element::column(lines)
         .padding(style::BUTTON_PADDING)
         .width(Length::FILL)
         .border(style::MENU_BORDER, style::QUIET.to_core())
@@ -279,11 +395,17 @@ fn row(panel: &Panel, item: &Item, key: IdKey) -> Element {
             normal,
             hovered,
             pressed: hovered,
-            off: loom_ui::StateLook::default(),
+            off: style::Role::Plain.looks().off,
         })
-        .key(key)
-        .focusable()
-        .access(access)
+        .key(key);
+    // A turned-off item stays a stop, as the APG keeps a disabled menu
+    // item focusable (section 6, rule 2).
+    let row = if item.off {
+        row.focusable_while_off()
+    } else {
+        row.focusable()
+    };
+    row.access(access)
 }
 
 #[cfg(test)]
