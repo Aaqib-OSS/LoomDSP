@@ -13,8 +13,7 @@ Writers (fast, append only, never fail the caller):
 Readers (run on demand):
   import     copies Claude Code transcripts and the spool into the archive
   report     prints the efficiency report
-  ui         opens the DuckDB UI over the archive
-  traces     opens otel-desktop-viewer with every span loaded
+  traces     opens otel-desktop-viewer with every span loaded (mise run devtel)
   export     writes the archive as OTLP JSON lines
 
 Standard library only, and Python 3.9 compatible, so a hook still works
@@ -537,13 +536,31 @@ def sql_list(paths):
     return "[" + ", ".join(sql_literal(path) for path in paths) + "]"
 
 
-def run_duckdb(sql, json_output=False, database=None):
-    """Run SQL in DuckDB against the archive and return stdout."""
-    command = duckdb_cmd() + (["-json"] if json_output else []) + [database or archive_path()]
-    result = subprocess.run(command, input=".bail on\n" + sql, capture_output=True, text=True)
-    if result.returncode != 0 or "Error:" in result.stderr:
-        raise RuntimeError(result.stderr.strip() or "duckdb failed")
-    return result.stdout
+class ArchiveBusy(RuntimeError):
+    """Another process holds the archive in a way this call cannot share."""
+
+
+def run_duckdb(sql, json_output=False, database=None, readonly=False, wait=0.0):
+    """Run SQL in DuckDB against the archive and return stdout.
+
+    DuckDB lets many read-only connections share a file, or one writer have
+    it alone. Readers open it read-only, so a report and the trace viewer
+    can be open at once. A call that meets a lock held by
+    another process tries again for up to `wait` seconds (an import takes a
+    few), then raises ArchiveBusy.
+    """
+    command = duckdb_cmd() + (["-json"] if json_output else []) + (["-readonly"] if readonly else [])
+    command.append(database or archive_path())
+    deadline = time.time() + wait
+    while True:
+        result = subprocess.run(command, input=".bail on\n" + sql, capture_output=True, text=True)
+        if result.returncode == 0 and "Error:" not in result.stderr:
+            return result.stdout
+        if "Could not set lock" not in result.stderr:
+            raise RuntimeError(result.stderr.strip() or "duckdb failed")
+        if time.time() >= deadline:
+            raise ArchiveBusy(result.stderr.strip())
+        time.sleep(0.5)
 
 
 def read_sql(name):
@@ -583,53 +600,85 @@ def record_files(kind, entries):
     return "insert or replace into imported_files values %s;\n" % values
 
 
+def take_import_lock(wait=0.0):
+    """Take import.lock, waiting up to `wait` seconds, and return its file, or None.
+
+    Every writer of the archive holds this lock first, so whoever holds it
+    knows no import can start. The lock is released when the file closes.
+    """
+    os.makedirs(store_dir(), exist_ok=True)
+    lock = open(os.path.join(store_dir(), "import.lock"), "w")
+    deadline = time.time() + wait
+    while True:
+        try:
+            import fcntl
+
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock
+        except ImportError:
+            return lock
+        except OSError:
+            if time.time() >= deadline:
+                lock.close()
+                return None
+            time.sleep(0.25)
+
+
 def import_all(quiet=False):
     """Copy new Claude Code records and spool spans into the archive.
 
     Idempotent: every row has a natural key and the import only inserts,
     so running it twice changes nothing, and a transcript Claude Code has
-    deleted keeps every row it already gave.
+    deleted keeps every row it already gave. When another import is
+    running, it is skipped.
     """
-    os.makedirs(store_dir(), exist_ok=True)
-    lock_path = os.path.join(store_dir(), "import.lock")
-    lock = open(lock_path, "w")
-    try:
-        import fcntl
-
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (ImportError, OSError):
+    lock = take_import_lock()
+    if lock is None:
         if not quiet:
-            print("devtel: another import is running; try again shortly", file=sys.stderr)
+            print("devtel: another import is running; import skipped", file=sys.stderr)
         return 1
     try:
-        run_duckdb(read_sql("schema.sql"))
-        claude = claude_files()
-        transcripts = [path for path in claude if path.endswith(".jsonl")]
-        metas = [path for path in claude if path.endswith(".meta.json")]
-        sql = []
-        counts = {}
-        for kind, paths, template in (
-            ("claude", transcripts, "import_claude.sql"),
-            ("claude-meta", metas, "import_agents.sql"),
-            ("spool", spool_files(), "import_spool.sql"),
-        ):
-            changed, _all = changed_files(kind, paths)
-            counts[kind] = len(changed)
-            # Batches keep each statement's file list to a reasonable size.
-            for start in range(0, len(changed), 200):
-                batch = changed[start : start + 200]
-                sql.append(read_sql(template).replace("$FILES", sql_list([entry[0] for entry in batch])))
-                sql.append(record_files(kind, batch))
-        sql.append(read_sql("views.sql"))
-        run_duckdb("begin;\n" + "\n".join(sql) + "\ncommit;\n")
+        return import_locked(quiet)
+    except ArchiveBusy:
         if not quiet:
             print(
-                "devtel: imported %d transcripts, %d agent files, %d spool files into %s"
-                % (counts["claude"], counts["claude-meta"], counts["spool"], archive_path())
+                "devtel: the archive is being read by another devtel command, so the import was "
+                "skipped; showing the data of the last import. Close the other window to import new data.",
+                file=sys.stderr,
             )
         return 0
     finally:
         lock.close()
+
+
+def import_locked(quiet):
+    """The import itself, run while holding import.lock."""
+    run_duckdb(read_sql("schema.sql"))
+    claude = claude_files()
+    transcripts = [path for path in claude if path.endswith(".jsonl")]
+    metas = [path for path in claude if path.endswith(".meta.json")]
+    sql = []
+    counts = {}
+    for kind, paths, template in (
+        ("claude", transcripts, "import_claude.sql"),
+        ("claude-meta", metas, "import_agents.sql"),
+        ("spool", spool_files(), "import_spool.sql"),
+    ):
+        changed, _all = changed_files(kind, paths)
+        counts[kind] = len(changed)
+        # Batches keep each statement's file list to a reasonable size.
+        for start in range(0, len(changed), 200):
+            batch = changed[start : start + 200]
+            sql.append(read_sql(template).replace("$FILES", sql_list([entry[0] for entry in batch])))
+            sql.append(record_files(kind, batch))
+    sql.append(read_sql("views.sql"))
+    run_duckdb("begin;\n" + "\n".join(sql) + "\ncommit;\n")
+    if not quiet:
+        print(
+            "devtel: imported %d transcripts, %d agent files, %d spool files into %s"
+            % (counts["claude"], counts["claude-meta"], counts["spool"], archive_path())
+        )
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -641,23 +690,15 @@ def report(days):
     """Print the efficiency report for the last given days."""
     import_all(quiet=True)
     sql = read_sql("report.sql").replace("$DAYS", str(int(days)))
-    sys.stdout.write(run_duckdb(".mode box\n" + sql))
+    sys.stdout.write(run_duckdb(".mode box\n" + sql, readonly=True, wait=30))
     return 0
-
-
-def open_ui():
-    """Open the DuckDB UI over the archive, after an import."""
-    import_all()
-    print("devtel: opening the DuckDB UI. The page loads its assets from ui.duckdb.org; your data stays local.")
-    print("devtel: start with `from devtel_sessions` or `from devtel_reruns`. Quit with Ctrl-D.")
-    return subprocess.call(duckdb_cmd() + ["-ui", archive_path()])
 
 
 def export_otlp(path, days):
     """Write the archive's spans as OTLP JSON lines, one trace per line."""
     import_all(quiet=True)
     sql = read_sql("export.sql").replace("$DAYS", str(int(days)))
-    rows = json.loads(run_duckdb(sql, json_output=True) or "[]")
+    rows = json.loads(run_duckdb(sql, json_output=True, readonly=True, wait=30) or "[]")
     by_trace = {}
     for row in rows:
         by_trace.setdefault((row["service"], row["trace_id"]), []).append(row)
@@ -683,15 +724,17 @@ def export_otlp(path, days):
 
 
 def wait_for_port(port, seconds):
-    """Wait until something listens on a local port."""
+    """Wait until something listens on a local port. Tries at least once."""
     deadline = time.time() + seconds
-    while time.time() < deadline:
+    while True:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            # "localhost" tries IPv6 and IPv4, whichever the server listens on.
+            with socket.create_connection(("localhost", port), timeout=0.5):
                 return True
         except OSError:
+            if time.time() >= deadline:
+                return False
             time.sleep(0.25)
-    return False
 
 
 def open_traces(days, port, open_browser=True):
@@ -757,7 +800,6 @@ def main(argv):
     importer.add_argument("--quiet", action="store_true")
     report_parser = commands.add_parser("report", help="print the efficiency report")
     report_parser.add_argument("--days", type=int, default=14)
-    commands.add_parser("ui", help="open the DuckDB UI over the archive")
     traces = commands.add_parser("traces", help="open otel-desktop-viewer with the spans loaded")
     traces.add_argument("--days", type=int, default=14)
     traces.add_argument("--port", type=int, default=8000)
@@ -796,8 +838,6 @@ def readers(args):
         return import_all(args.quiet)
     if args.command == "report":
         return report(args.days)
-    if args.command == "ui":
-        return open_ui()
     if args.command == "traces":
         return open_traces(args.days, args.port, not args.no_open)
     if args.command == "export":

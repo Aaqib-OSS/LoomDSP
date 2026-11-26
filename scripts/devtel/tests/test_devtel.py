@@ -276,6 +276,49 @@ class ArchiveTests(StoreTestCase):
             for line in handle:
                 self.assertIn("resourceSpans", json.loads(line))
 
+    def test_readers_share_the_archive_and_an_import_waits_its_turn(self):
+        """While another command reads the archive, the import skips and readers still work."""
+        import select
+
+        devtel.import_all(quiet=True)
+        holder = subprocess.Popen(
+            devtel.duckdb_cmd() + ["-readonly", "-noheader", "-list", devtel.archive_path()],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            # The holder answers a query only once it has the archive open.
+            holder.stdin.write("select 4242;\n")
+            holder.stdin.flush()
+            ready, _, _ = select.select([holder.stdout], [], [], 60)
+            self.assertTrue(ready, "the holder never answered")
+            self.assertEqual(holder.stdout.readline().strip(), "4242")
+            # A span written now is new data the skipped import must leave out.
+            devtel.emit("hooks", "checks", [devtel.span("a" * 32, "d" * 16, None, "late", 1, 2, {})])
+            self.assertEqual(devtel.import_all(quiet=True), 0)
+            count = "select count(*) as n from spool_spans where span_id = '%s'" % ("d" * 16)
+            self.assertEqual(json.loads(devtel.run_duckdb(count, json_output=True, readonly=True))[0]["n"], 0)
+            self.assertGreater(devtel.export_otlp(os.path.join(self.dir, "out.jsonl"), 30), 0)
+        finally:
+            holder.stdin.close()
+            holder.wait(timeout=30)
+        # Once the other reader closes, the next import brings the new span in.
+        self.assertEqual(devtel.import_all(quiet=True), 0)
+        self.assertEqual(json.loads(devtel.run_duckdb(count, json_output=True, readonly=True))[0]["n"], 1)
+    def test_import_skips_while_another_import_holds_the_lock(self):
+        """Only one import writes at a time; another one skips and adds nothing."""
+        devtel.import_all(quiet=True)
+        devtel.emit("hooks", "checks", [devtel.span("a" * 32, "c" * 16, None, "late", 1, 2, {})])
+        count = "select count(*) as n from spool_spans where span_id = '%s'" % ("c" * 16)
+        lock = devtel.take_import_lock(wait=5)
+        self.assertIsNotNone(lock)
+        try:
+            self.assertEqual(devtel.import_all(quiet=True), 1)
+            self.assertEqual(json.loads(devtel.run_duckdb(count, json_output=True, readonly=True))[0]["n"], 0)
+        finally:
+            lock.close()
+        self.assertEqual(devtel.import_all(quiet=True), 0)
+        self.assertEqual(json.loads(devtel.run_duckdb(count, json_output=True, readonly=True))[0]["n"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
