@@ -484,6 +484,15 @@ impl App {
         {
             self.session.outline.last_toolbar = Some(part.clone());
         }
+        // The tree has the keys while one of its rows has the runtime's
+        // focus, and lets them go when the focus leaves its rows.
+        let rows = crate::outline::panel::rows_id();
+        if focus.as_ref().is_some_and(|part| part.is_under(&rows)) {
+            self.session.outline.active = true;
+        } else if self.focus.as_ref().is_some_and(|part| part.is_under(&rows)) {
+            self.session.outline.active = false;
+        }
+        self.matrix_focus_moved(focus.as_ref());
         self.focus = focus;
         if let Some(part) = gained {
             self.effect(loom_ui::Effects::focus_and_select_all(part));
@@ -626,7 +635,7 @@ impl App {
     /// and the windows over the canvas have their own use of the keys.
     pub(crate) fn text_field_tab(&mut self, focused: Option<&UiId>, backwards: bool) {
         if focused.is_none()
-            || self.matrix_has_keys()
+            || self.focus_in_matrix()
             || !self.no_overlay()
             || self.text_field_tabs(focused)[usize::from(backwards)]
         {

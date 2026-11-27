@@ -425,7 +425,7 @@ pub(crate) fn tree(
     let groups = frame.ours(ours, frames);
     let mut children = groups.toolbar;
     children.extend(groups.breadcrumb);
-    children.push(frame.tabs(snapshot.matrix.tab));
+    children.extend(groups.tabs);
     let bar = groups.bar;
     // The runtime's overlay that owns the input (row 3b): an alert dialog
     // for the question, named by its title, or a menu, modal, around the
@@ -448,17 +448,20 @@ pub(crate) fn tree(
     };
     // The open panel, drawn beside the canvas: each of its parts, and the
     // panel itself marked as cutting off what it scrolls out of view.
-    let outline = snapshot.matrix.tab == Tab::Outline && frames.jump.is_empty();
     let mut panel: Vec<NodeId> = frames.panel.iter().map(|item| frame.panel(item)).collect();
     // The runtime's inspector, when it draws the column (plan 3.2, row 4d):
     // its scroll container is the panel's node, as Iced's content was.
     panel.extend(groups.inspector);
-    if outline {
-        panel.push(frame.outline(&snapshot.outline, frames.focused_item.as_ref()));
-    }
-    if !frames.jump.is_empty() {
-        panel.push(frame.panel(&frames.jump[0]));
-    }
+    // The runtime's Outline tree and jump list (plan 3.2, row 4e), each in
+    // the group its pattern names, the rows flat under the tree (section
+    // 7, rule 12).
+    panel.extend(groups.outline);
+    panel.extend(groups.jump);
+    // The runtime's matrix (plan 3.2, row 4e, commit 3), its parts in one
+    // group, the card list a list inside it.
+    panel.extend(groups.matrix);
+    // The open tab's content, in its tab panel (the WAI-ARIA Tabs pattern).
+    let panel = frame.tab_panel(panel, snapshot.matrix.tab);
     // The overlay that owns the input is not below anything: it is reported
     // and acts, while what it covers is hidden.
     let covered = std::mem::replace(&mut frame.covered, false);
@@ -476,9 +479,9 @@ pub(crate) fn tree(
         .as_ref()
         .filter(|id| {
             items::find(&frames.panel, id).is_some()
-                || items::find(&frames.jump, id).is_some()
-                || (outline && snapshot.outline.iter().any(|row| &row.id == *id))
-                || **id == tab_id(Tab::Inspector)
+                || id.is_under(&crate::outline::tree_id())
+                || id.is_under(&crate::outline::jump_id())
+                || id.is_under(&crate::matrix::panel::matrix_id())
         })
         .map(|id| node_id(table, id));
     // Focus is on the window unless a control on the canvas has it.
@@ -752,8 +755,6 @@ pub(crate) struct Frames {
     /// The open panel's parts: the inspector's or the matrix's, by the tab
     /// that is open.
     pub panel: Vec<items::Item>,
-    /// The temporary cable branch list.
-    pub jump: Vec<items::Item>,
     /// The text field with keyboard focus, as the window last said.
     pub focused_field: Option<iced::advanced::widget::Id>,
     /// The panel part the keys act on while no text field has them: the
@@ -790,46 +791,14 @@ pub(crate) fn fixed_id(text: &str) -> UiId {
 /// The UI ID of the toolbar. Every button's ID is inside it.
 pub(crate) use crate::toolbar::toolbar_id;
 
-/// The UI ID of the right panel's tabs. Each tab's ID is inside it.
-pub(crate) fn tabs_id() -> UiId {
-    UiId::panel("panel")
-}
-
-/// The UI ID of one of the right panel's tabs.
-pub(crate) fn tab_id(tab: Tab) -> UiId {
-    tabs_id().with(match tab {
-        Tab::Inspector => "inspector",
-        Tab::Matrix => "matrix",
-        Tab::Outline => "outline",
-    })
-}
+/// The UI IDs of the right panel's tabs and of each tab, which the
+/// runtime draws (`tabs.rs`).
+pub(crate) use crate::tabs::{tab_id, tabs_id};
 
 /// True for a node of the stats bar that shows a live value: the load and
 /// the dropouts. It is sent at most every 250 ms, as a meter is.
 pub(crate) fn is_live_bar_item(id: &UiId) -> bool {
     *id == fixed_id("stats/load") || *id == fixed_id("stats/dropouts")
-}
-
-/// What a press on a part Iced draws outside the canvas does, by the
-/// node's UI ID. The toolbar, the breadcrumb, and the bar are `loom-ui`'s,
-/// and act through their own clicks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FramePart {
-    /// One of the right panel's tabs.
-    Tab(Tab),
-}
-
-/// What `id` names outside the canvas, if it names something that acts.
-pub(crate) fn frame_part(id: &UiId) -> Option<FramePart> {
-    if let [IdKey::Name(panel), IdKey::Name(name)] = id.keys() {
-        match (&**panel, &**name) {
-            ("panel", "inspector") => return Some(FramePart::Tab(Tab::Inspector)),
-            ("panel", "matrix") => return Some(FramePart::Tab(Tab::Matrix)),
-            ("panel", "outline") => return Some(FramePart::Tab(Tab::Outline)),
-            _ => {}
-        }
-    }
-    None
 }
 
 /// Builds the nodes of the window around the canvas: the toolbar, the
@@ -934,20 +903,18 @@ impl Frame<'_> {
             Kind::Option => Role::RadioButton,
             Kind::Choice => Role::ComboBox,
             Kind::Field => Role::TextInput,
-            Kind::List => Role::List,
-            Kind::ListItem => Role::ListItem,
             Kind::ListBox => Role::ListBox,
             Kind::ListBoxOption => Role::ListBoxOption,
         });
-        // A list says how many rows it has, and each row its place, so a
-        // screen reader can say "3 of 7". AccessKit puts the size on the
+        // A list box says how many options it has, and each its place, so
+        // a screen reader can say "3 of 7". AccessKit puts the size on the
         // list and counts places from zero.
-        if matches!(item.kind, Kind::List | Kind::ListBox) {
+        if item.kind == Kind::ListBox {
             let rows: Vec<usize> = item
                 .children
                 .iter()
                 .zip(&built)
-                .filter(|(child, _)| matches!(child.kind, Kind::ListItem | Kind::ListBoxOption))
+                .filter(|(child, _)| child.kind == Kind::ListBoxOption)
                 .map(|(_, (_, pushed))| *pushed)
                 .collect();
             node.set_size_of_set(rows.len());
@@ -1022,50 +989,17 @@ impl Frame<'_> {
         id
     }
 
-    /// The visible outline rows, flat under one tree.
-    fn outline(&mut self, rows: &[crate::outline::Row], focus: Option<&UiId>) -> NodeId {
-        let mut children = Vec::new();
-        for row in rows {
-            let mut node = Node::new(Role::TreeItem);
-            node.set_label(row.name.clone());
-            if !row.description.is_empty() {
-                node.set_description(row.description.clone());
-            }
-            node.set_level(row.level - 1);
-            node.set_position_in_set(row.position - 1);
-            node.set_size_of_set(row.size);
-            if let Some(expanded) = row.expanded {
-                node.set_expanded(expanded);
-            }
-            node.set_selected(focus == Some(&row.id));
-            node.add_action(Action::Focus);
-            node.add_action(Action::Click);
-            children.push(self.add(&row.id, node));
+    /// The open tab's content, the nodes `content`, in a tab panel named by
+    /// its tab, which the open tab says it controls (the WAI-ARIA Tabs
+    /// pattern). Nothing when there is no content.
+    fn tab_panel(&mut self, content: Vec<NodeId>, open: Tab) -> Vec<NodeId> {
+        let id = crate::tabs::tabs_id().with("content");
+        let panel = self.group(content, Role::TabPanel, crate::tabs::label(open), &id);
+        let tab = node_id(self.table, &tab_id(open));
+        if let Some((_, node)) = self.nodes.iter_mut().find(|(node, _)| *node == tab) {
+            node.set_controls(panel.clone());
         }
-        let mut tree = Node::new(Role::Tree);
-        tree.set_label("Outline");
-        tree.set_children(children);
-        self.add(&crate::outline::tree_id(), tree)
-    }
-
-    /// The right panel's tabs: a tab list with the open tab selected.
-    fn tabs(&mut self, open: Tab) -> NodeId {
-        let mut tabs = Vec::new();
-        for (tab, label) in [
-            (Tab::Inspector, "Inspector"),
-            (Tab::Matrix, "Matrix"),
-            (Tab::Outline, "Outline"),
-        ] {
-            let mut node = Node::new(Role::Tab);
-            node.set_label(label);
-            node.set_selected(tab == open);
-            node.add_action(Action::Click);
-            tabs.push(self.add(&tab_id(tab), node));
-        }
-        let mut list = Node::new(Role::TabList);
-        list.set_label("Right panel");
-        list.set_children(tabs);
-        self.add(&tabs_id(), list)
+        panel
     }
 
     /// The runtime's own nodes, from `loom-ui`'s layout, as the window's
@@ -1141,8 +1075,20 @@ impl Frame<'_> {
         let breadcrumb = under(&crate::breadcrumb::breadcrumb_id());
         let bar = under(&crate::stats_bar::stats_id());
         let inspector = under(&crate::inspector::panel::inspector_id());
+        let tabs = under(&tabs_id());
+        let outline = under(&crate::outline::tree_id());
+        // The jump list's list box is the runtime's node.
+        let jump = under(&crate::outline::jump_id());
+        let matrix_id = crate::matrix::panel::matrix_id();
+        let matrix = under(&matrix_id);
         Ours {
+            matrix: self.group(matrix, Role::Group, "Modulation matrix", &matrix_id),
             inspector,
+            // The right panel's tabs, one stop with arrows inside (the
+            // WAI-ARIA Tabs pattern).
+            tabs: self.group(tabs, Role::TabList, "Right panel", &tabs_id()),
+            outline: self.group(outline, Role::Tree, "Outline", &crate::outline::tree_id()),
+            jump,
             // The toolbar is one stop with arrows inside, the WAI-ARIA
             // toolbar pattern (Brylie's decision, 2026-11-19), so its node
             // says so; the breadcrumb is a list of links, a group.
@@ -1202,6 +1148,14 @@ struct Ours {
     bar: Vec<NodeId>,
     /// The runtime's inspector's top nodes, while it draws the column.
     inspector: Vec<NodeId>,
+    /// The right panel's tab list.
+    tabs: Vec<NodeId>,
+    /// The Outline's tree, its rows flat under it.
+    outline: Vec<NodeId>,
+    /// The cable jump list's list box, while it is open.
+    jump: Vec<NodeId>,
+    /// The matrix's group, while its tab is open.
+    matrix: Vec<NodeId>,
     /// The top nodes of the runtime's overlay that owns the input.
     overlay: Vec<NodeId>,
 }

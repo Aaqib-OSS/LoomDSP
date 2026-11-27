@@ -92,6 +92,7 @@ mod stream;
 mod style;
 mod subscriptions;
 mod surface;
+mod tabs;
 mod targets;
 mod timers;
 mod toolbar;
@@ -106,7 +107,7 @@ mod window_question;
 mod xy;
 
 use clap::Parser;
-use iced::{Color, Size, Theme};
+use iced::{Size, Theme};
 use loom_canvas::CanvasEvent;
 use loom_core::{Controller, InputRef, MidiEvent, ModuleDescriptor, ModuleId, OutputRef, OutputSafety, ProbeId};
 use loom_patch::Patch;
@@ -550,14 +551,18 @@ enum Message {
     SliderReleased,
     /// A change in the session-only modulation matrix.
     Matrix(MatrixEvent),
-    /// A key handled by the focused matrix even if a widget used it.
-    MatrixKey(iced::keyboard::Event),
     /// A message for the Preferences window (`docs/design/preferences.md`).
     Preferences(settings::Message),
     /// Focuses a row of the patch outline.
     OutlineRow(loom_ui_core::UiId),
     /// Takes one of the offered cable jumps.
     JumpChoice(usize),
+    /// One of the tree keys on the Outline's list, which took it first
+    /// (plan 3.2, row 4e): `command` while Command or Ctrl is held.
+    OutlineKey {
+        key: loom_ui_core::Key,
+        command: bool,
+    },
     /// A pointer press outside the cable jump list.
     DismissJump,
     /// An edit in patch info (`docs/design/patch-metadata.md`).
@@ -877,10 +882,10 @@ impl Message {
             | Self::FocusStep { .. }
             | Self::SliderReleased
             | Self::Matrix(_)
-            | Self::MatrixKey(_)
             | Self::Preferences(_)
             | Self::OutlineRow(_)
             | Self::JumpChoice(_)
+            | Self::OutlineKey { .. }
             | Self::DismissJump
             | Self::PatchInfo(_)
             | Self::Licence(_)
@@ -1849,6 +1854,7 @@ impl App {
             }
             Message::File(FileAction::Browse) => self.open_patches(),
             Message::Key(event) if self.navigation_key(&event, now) => {}
+            Message::OutlineKey { key, command } => self.outline_panel_key_pressed(key, command, now),
             // An open menu has its own keys (`menus.rs`): Enter sends what its item sends.
             Message::Key(event)
                 if menus::is_menu_key(&event)
@@ -1921,7 +1927,6 @@ impl App {
                 }
             }
             Message::Matrix(event) => self.matrix_message(event),
-            Message::MatrixKey(key) => self.matrix_key_message(key),
             Message::ControlFrame(now) => self.control_frame(now),
             Message::FieldPasteRefused => {
                 self.alerts.warn(crate::clipboard::COULD_NOT_READ.to_string());
@@ -2255,6 +2260,7 @@ impl App {
             | Message::TextFieldTab { .. }
             | Message::TabFrom { .. }
             | Message::EnterFields { .. }
+            | Message::OutlineKey { .. }
             | Message::ToolbarFocus(_)
             | Message::MenuTab { .. }
             | Message::MenuMove { .. }
@@ -2264,8 +2270,7 @@ impl App {
             | Message::Located { .. }
             | Message::Captured { .. }
             | Message::TypeFocus { .. }
-            | Message::Matrix(_)
-            | Message::MatrixKey(_) => {}
+            | Message::Matrix(_) => {}
             Message::A11y(_) => {}
             Message::ShowHelp => {
                 if self.overlays.help.is_none() {
@@ -2378,9 +2383,6 @@ impl App {
             Message::Recent(message) => self.recent_message(message),
             Message::FileDropped(path) => self.file_dropped(path),
             Message::DropsDone => self.drops_done(),
-            Message::Key(iced::keyboard::Event::KeyPressed { modifiers, .. })
-                if self.matrix_has_keys() && !modifiers.command() => {}
-            Message::Key(iced::keyboard::Event::KeyReleased { .. }) if self.matrix_has_keys() => {}
             Message::ProbeMenu(message) => {
                 if let (Some(menu), probe_menu::Message::Pick(probe)) = (self.overlays.take_probe_menu(), message) {
                     self.add_probe(probe, menu.output, menu.world);
@@ -2656,9 +2658,6 @@ impl App {
         self.session.run_driven = driven;
     }
 }
-
-/// Quiet text. The same as `style::QUIET`, kept as a short name here.
-const DIM: Color = style::QUIET;
 
 /// Inspector help text, shown with nothing selected. It lists every canvas
 /// gesture and shortcut (#16), so keep it in step with `PatchCanvas::handle`

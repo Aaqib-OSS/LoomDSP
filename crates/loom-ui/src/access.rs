@@ -240,6 +240,8 @@ pub struct Access {
     position: Option<usize>,
     /// How many items it holds, as a list box.
     size: Option<usize>,
+    /// How deep it sits in a tree, counted from 0 for a top row.
+    level: Option<usize>,
 }
 
 /// A way an [`Access`] breaks section 7, rule 2.
@@ -301,6 +303,7 @@ impl Access {
             controls: None,
             position: None,
             size: None,
+            level: None,
         }
     }
 
@@ -371,6 +374,15 @@ impl Access {
     #[must_use]
     pub fn size_of_set(mut self, size: usize) -> Self {
         self.size = Some(size);
+        self
+    }
+
+    /// Says it sits `level` deep in a tree, counted from 0 for a top row,
+    /// as a tree item does, whose rows a tree sends flat (section 7,
+    /// rule 12).
+    #[must_use]
+    pub fn level(mut self, level: usize) -> Self {
+        self.level = Some(level);
         self
     }
 
@@ -518,6 +530,9 @@ impl Access {
         }
         if let Some(size) = self.size {
             node.set_size_of_set(size);
+        }
+        if let Some(level) = self.level {
+            node.set_level(level);
         }
         if !self.states.disabled {
             for action in &self.actions {

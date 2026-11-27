@@ -75,7 +75,7 @@ impl App {
     /// answer the view, the stops, Tab, and the tree read, so the column is
     /// drawn, focused, and reported by one toolkit at a time.
     pub(crate) fn inspector_ours(&self) -> bool {
-        self.right_tab == Tab::Inspector && self.jump_view().is_none()
+        self.right_tab == Tab::Inspector && !self.session.outline.has_jump()
     }
 
     /// Whether the inspector's panel owns the input: it is the runtime's,
@@ -256,8 +256,10 @@ impl App {
         let to = if back { at.checked_sub(1) } else { Some(at + 1) };
         let past = || {
             let (top, bar) = (self.top_stops(), self.bar_stops());
+            // Back past the first stop, the tab list, the one stop before
+            // its panel (the WAI-ARIA Tabs pattern).
             if back {
-                top.last().or(bar.last()).cloned()
+                self.tabs_stops().first().or(top.last()).or(bar.last()).cloned()
             } else {
                 bar.first().or(top.first()).cloned()
             }
