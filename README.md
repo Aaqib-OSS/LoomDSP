@@ -44,12 +44,12 @@ The goal is bigger than a synth. LoomDSP is for **living musical systems**: patc
 | Phase | What you get |
 |---|---|
 | **M0. Engine** (done) | A real-time engine that plays patch files with live MIDI. |
-| **M1. Desktop patcher** (now) | Build and play a synth from primitives, with MIDI controllers. |
-| M2. Panels and performance | Sub-patches with their own front panels, polyphony, presets, and a locked performance mode. |
-| M3. Living systems | Loopers, sequencers, scenes, counters, and logic: patches that arrange themselves on stage. |
+| **M1. Desktop patcher** | Build and play a synth from primitives, with MIDI controllers. |
+| **M2. Encapsulation and polyphony** (now) | Sub-patches, a library of your own parts, polyphony, and swappable parts in slots. |
+| M3. Living systems | Front panels, presets, and a locked performance mode first. Then loopers, sequencers, scenes, counters, and logic: patches that arrange themselves on stage. |
 | M4. Sharing | Self-contained patch files, a patch library, and a module SDK for community modules. |
 
-Plugin export (CLAP, VST3) and a browser version may come later. See the full [roadmap](docs/product/roadmap.md).
+Plugin and standalone export (CLAP, VST3) and a browser version come after M3. They will ship: the roadmap sets when, not whether. See the full [roadmap](docs/product/roadmap.md).
 
 ## What you can do today
 

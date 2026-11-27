@@ -198,7 +198,7 @@ These details were settled while building the module.
 
 ## Clock to phase
 
-**Status:** Agreed, M2 ([#116](https://github.com/brylie/LoomDSP/issues/116), 2026-11-01). Decides how LoomDSP multiplies a clock that arrives only as triggers: turn it into a phase, then multiply the phase as usual with Phase Scale and Phase Trigger. *Why:* every clock tool in LoomDSP works in the phase domain ([phase and cycles](../learn/phase-and-cycles.md)); this module is the one place that has to measure time.
+**Status:** Agreed, M3 ([#116](https://github.com/brylie/LoomDSP/issues/116), 2026-11-01). Decides how LoomDSP multiplies a clock that arrives only as triggers: turn it into a phase, then multiply the phase as usual with Phase Scale and Phase Trigger. *Why:* every clock tool in LoomDSP works in the phase domain ([phase and cycles](../learn/phase-and-cycles.md)); this module is the one place that has to measure time.
 
 `loom.phase.from-clock` (MT-PHASE-09):
 
@@ -217,7 +217,7 @@ These details were settled while building the module.
 
 ## MIDI clock
 
-**Status:** Agreed, M2 ([#77](https://github.com/brylie/LoomDSP/issues/77), 2026-11-01). Requirements: FR-MIDI-07, FR-LIB-25.
+**Status:** Implemented, M2 ([#77](https://github.com/brylie/LoomDSP/issues/77), 2026-11-01). Requirements: FR-MIDI-07, FR-LIB-25.
 
 > I play with a drum machine. In Preferences I set the clock source to it. The Transport tile says "Following TR clock", my sequencers follow its tempo and its Start and Stop, and the LoomDSP clock goes on to my synth.
 
