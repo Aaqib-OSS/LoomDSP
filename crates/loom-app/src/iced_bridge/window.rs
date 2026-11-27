@@ -28,6 +28,7 @@ use iced::advanced::widget::operation::Outcome;
 use iced::{Task, mouse};
 use iced_runtime::user_interface::{Cache, State, UserInterface};
 use iced_wgpu::graphics::Shell;
+use loom_canvas::iced_convert::ToIced as _;
 use loom_ui::shell::{Frame, Ime, Layers, Opened, Parts, Pointer, Redraw, Report};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -397,10 +398,10 @@ impl Layers<Hosted, IcedTarget> for WindowLayers {
 
     fn draw(&mut self, mut parts: Parts<'_, Hosted, IcedTarget>, frame: &Frame<'_>) {
         let app = &parts.app.0;
-        let theme = app.theme();
-        let background = theme.palette().background;
+        let theme = super::theme();
+        let background = crate::style::PANEL_FILL.to_iced();
         let style = Style {
-            text_color: theme.palette().text,
+            text_color: crate::style::TEXT.to_iced(),
         };
         let physical = iced::Size::new(
             (frame.size.width * frame.scale).round() as u32,
@@ -443,7 +444,7 @@ impl Layers<Hosted, IcedTarget> for WindowLayers {
         // Iced, with the one typesetter (ui-layer.md, section 5, rule 9).
         let mut panels = self.panels.take();
         if let Some(panels) = panels.as_mut() {
-            let (below, above) = self.paint_panels(&mut parts, frame, &theme);
+            let (below, above) = self.paint_panels(&mut parts, frame);
             panels.set(&target, below, above);
         }
         if app.pointer.waiting() {
@@ -469,12 +470,12 @@ impl Layers<Hosted, IcedTarget> for WindowLayers {
             // The canvas widget leaves its frame in the app's slot while
             // Iced draws; emptied first, so only this frame's is drawn.
             app.canvas_drawn.clear();
-            ui.draw(renderer, &theme, &style, cursor);
+            ui.draw(renderer, theme, &style, cursor);
             if let State::Updated { input_method, .. } = &state
                 && let Some(composed) = super::preedit::of(input_method)
                 && let iced::advanced::InputMethod::Enabled { cursor: caret, .. } = input_method
             {
-                super::preedit::draw(renderer, composed, *caret, window, &theme, crate::style::BODY);
+                super::preedit::draw(renderer, composed, *caret, window, crate::style::BODY);
             }
             let drawing = app.canvas_drawn.take();
             super::paint::draw(&target, wgpu(renderer), &mut pass, drawing, background, panels.as_ref());
@@ -561,18 +562,17 @@ impl WindowLayers {
     /// Lays out the runtime's own panels and paints them into two lists:
     /// the canvas and panels layers, drawn below Iced, and the overlays
     /// and question layers, drawn above it. Text with no colour of its own
-    /// takes the theme's text colour.
+    /// takes the app's text colour (`style::TEXT`).
     fn paint_panels(
         &self,
         parts: &mut Parts<'_, Hosted, IcedTarget>,
         frame: &Frame<'_>,
-        theme: &iced::Theme,
     ) -> (loom_ui::paint::PaintList, loom_ui::paint::PaintList) {
         use loom_ui::paint::ListPainter;
         self.text.borrow_mut().begin_frame();
         parts.panels.lay_out(&mut *self.text.borrow_mut());
         let whole = loom_ui_core::Rect::new(loom_ui_core::Point::ORIGIN, frame.size);
-        let style = super::paint::panel_style(theme);
+        let style = super::paint::panel_style();
         super::paint::paint_sides(whole, |layer, list| {
             parts
                 .panels

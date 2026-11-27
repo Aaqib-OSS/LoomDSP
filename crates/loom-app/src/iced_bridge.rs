@@ -395,17 +395,14 @@ impl loom_ui::App for Hosted {
         self.0.tab_from(from, next, back)
     }
 
-    /// Hover text in the look of Iced's tooltips: the theme's weak
-    /// background, a 2 px radius, 6 px padding, at most 480 wide.
+    /// Hover text in the look of Iced's tooltips: the raised fill
+    /// (`style::RAISED`), a 2 px radius, 6 px padding, at most 480 wide.
     fn hint_style(&self) -> loom_ui::HintStyle {
-        use loom_canvas::iced_convert::ToCore as _;
-        let theme = self.0.theme();
-        let palette = theme.extended_palette();
         loom_ui::HintStyle {
             text: crate::style::BODY_TEXT,
-            colour: palette.background.weak.text.to_core(),
-            background: palette.background.weak.color.to_core(),
-            border: palette.background.weak.color.to_core(),
+            colour: crate::style::TEXT,
+            background: crate::style::RAISED,
+            border: crate::style::RAISED,
             border_width: 0.0,
             radius: 2.0,
             padding: 6.0,
@@ -1002,6 +999,32 @@ mod window;
 pub(crate) use services::AppServices;
 /// The bridge the crate's tests run on: the `Ui` harness's, the only one
 /// left since the app runs on the shell (`window.rs`).
+/// Iced's theme, for what Iced still draws until the cut-over (plan for
+/// leaving Iced, P4): the window's two rules and the default text colour.
+/// Built once, from the app's tokens in `style.rs`, so the app itself
+/// keeps no theme and reads no shade Iced works out. P4 deletes it with
+/// the bridge.
+pub(crate) fn theme() -> &'static iced::Theme {
+    use loom_canvas::iced_convert::ToIced as _;
+    static THEME: std::sync::LazyLock<iced::Theme> = std::sync::LazyLock::new(|| {
+        iced::Theme::custom(
+            "Loom",
+            iced::theme::Palette {
+                background: crate::style::PANEL_FILL.to_iced(),
+                text: crate::style::TEXT.to_iced(),
+                primary: crate::style::ACCENT.to_iced(),
+                // The only colours outside `style.rs`: Iced's palette needs a
+                // value for each, nothing the app draws reads them, and P4
+                // deletes them with the bridge. Kept as they were.
+                success: iced::Color::from_rgb8(0x4C, 0xB0, 0x6E),
+                warning: iced::Color::from_rgb8(0xE8, 0xD2, 0x4A),
+                danger: crate::style::DANGER.normal.fill.expect("danger is filled").to_iced(),
+            },
+        )
+    });
+    &THEME
+}
+
 #[cfg(test)]
 pub(crate) type AppBridge = Bridge<headless::UiDriver>;
 #[cfg(test)]
