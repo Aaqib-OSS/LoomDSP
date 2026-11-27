@@ -6,11 +6,27 @@
         "hooks": [
           {
             "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/scripts/claude/session-env.sh\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
             "command": "sh \"$CLAUDE_PROJECT_DIR/scripts/devtel/hook.sh\" session-start",
             "timeout": 10
           }
         ]
       }
     ]
+  },
+  "extraKnownMarketplaces": {
+    "ast-grep-marketplace": {
+      "source": {
+        "source": "github",
+        "repo": "ast-grep/agent-skill"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "ast-grep@ast-grep-marketplace": true
   }
 }
