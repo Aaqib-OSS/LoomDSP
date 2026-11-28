@@ -2667,7 +2667,7 @@ Right-drag or two-finger scroll to pan. Wheel or Cmd/Ctrl-scroll to zoom. Cmd/Ct
 F or Home frames the patch.\n\
 F1, or Cmd/Ctrl+/, opens help for the selected module, or this page.\n\
 Shift+F10, the menu key, or Alt+Enter (Option+Return) opens the selected module's menu.\n\
-Ctrl+Tab and Ctrl+Shift+Tab move between the canvas, the right column, and the toolbar.\n\
+Ctrl+Tab and Ctrl+Shift+Tab, or F6 and Shift+F6, move between the canvas, the right column, and the toolbar.\n\
 M cycles the patch map. O opens the Outline. The bracket keys follow a cable, and Cmd/Ctrl+[ goes back.\n\
 Right-click an output or a cable to add a scope or a meter fed by it.\n\
 Click a modulation badge to pin its lines; click again or press Escape to hide them.\n\

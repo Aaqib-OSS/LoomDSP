@@ -1045,6 +1045,116 @@ fn leaving_a_row_that_went_clears_the_drop_row() {
     assert!(ui.app().inspector_hovered(&gone, true).is_none(), "it takes no drop");
 }
 
+/// On a sub-patch's exposed row the value field stays at the right of the
+/// label line, as on a module's row, and the Expose or Unexpose button
+/// goes on a line of its own under it (#901).
+#[test]
+fn an_exposed_rows_field_stays_on_its_label_line() {
+    let patch = include_str!("../../../../../examples/patches/nested-subtractive.ron");
+    let mut ui = Ui::with_app(crate::tests::app_with_text(patch));
+    ui.send(Message::Canvas(CanvasEvent::Select(vec![2])));
+    let _ = ui.redraw();
+    let row = ids::row(2, ids::Kind::Exposed, "cutoff");
+    let bounds = |part: &'static str| ui.runtime().bounds(&ids::part(&row, part)).expect(part);
+    let (field, expose, slider) = (bounds("field"), bounds("expose"), bounds("value"));
+    assert_eq!(
+        field.x + field.width,
+        slider.x + slider.width,
+        "the field ends at the row's right edge"
+    );
+    assert!(
+        field.y + field.height <= expose.y,
+        "the button's line is under the field's: {field:?}, {expose:?}"
+    );
+}
+
+/// The port list's lines are about 18 px apart, and the Outputs group
+/// sits 8 px further down than its lines' spacing, so the two groups read
+/// apart (#901).
+#[test]
+fn the_port_lists_groups_read_apart() {
+    let mut ui = Ui::open("subtractive.ron");
+    ui.send(Message::Canvas(CanvasEvent::Select(vec![4])));
+    let _ = ui.redraw();
+    let crate::inspector::Inspector::Module(module) = ui.app().inspector_model() else {
+        panic!("a module's inspector");
+    };
+    let line = |ui: &Ui, direction: &str, label: &str| {
+        let id = ids::panel(4).with("port").with(direction).with(label);
+        ui.runtime().bounds(&id).unwrap_or_else(|| panic!("{id} is laid out"))
+    };
+    let inputs: Vec<_> = module.ports.iter().filter(|p| p.direction == "Input").collect();
+    let outputs: Vec<_> = module.ports.iter().filter(|p| p.direction == "Output").collect();
+    assert!(
+        inputs.len() >= 2 && !outputs.is_empty(),
+        "the filter has inputs and outputs"
+    );
+    let (first, second) = (line(&ui, "Input", inputs[0].label), line(&ui, "Input", inputs[1].label));
+    let pitch = second.y - first.y;
+    assert!((17.0..=19.0).contains(&pitch), "about 18 px from line to line: {pitch}");
+    let last_in = line(&ui, "Input", inputs[inputs.len() - 1].label);
+    let first_out = line(&ui, "Output", outputs[0].label);
+    // Between the groups: 8 px, the heading's own line, and the column's
+    // 2 px around it.
+    let between = first_out.y - (last_in.y + last_in.height);
+    assert!(between >= 8.0 + first.height, "the groups read apart: {between}");
+}
+
+/// The column's content has equal margins left and right, with the
+/// scrollbar's gutter kept whether it scrolls or not, so nothing moves
+/// sideways when a short window makes it scroll (Brylie's decision,
+/// 2026-11-27; ui-layer.md, section 5, rule 12).
+#[test]
+fn the_column_margins_match_and_hold_when_it_scrolls() {
+    let margins = |ui: &mut Ui| {
+        let _ = ui.redraw();
+        let column = ui.runtime().bounds(&inspector_id()).expect("the column");
+        let field = ui.runtime().bounds(&authors_part()).expect("Authors");
+        (
+            field.x - column.x,
+            (column.x + column.width) - (field.x + field.width),
+            field.width,
+        )
+    };
+    let mut ui = patch_info();
+    let before = margins(&mut ui);
+    let (left, right, _) = before;
+    assert_eq!(left, right, "left {left}, right {right}");
+    ui.resize(1000.0, 260.0);
+    let _ = ui.redraw();
+    let column = ui.runtime().bounds(&inspector_id()).expect("the column");
+    let shortcuts = ui
+        .runtime()
+        .bounds(&ids::part(&ids::patch(), "shortcuts"))
+        .expect("Keyboard shortcuts");
+    assert!(
+        shortcuts.y + shortcuts.height > column.y + column.height,
+        "the short window makes the column scroll: {shortcuts:?} in {column:?}"
+    );
+    assert_eq!(margins(&mut ui), before, "nothing moved sideways");
+
+    // Preferences, the other container that pads its content inside its
+    // scroll, matches too: its Output safety group starts at the content's
+    // left edge, and its "Your name" field ends at the right one.
+    let mut ui = patch_info();
+    ui.tap(Key::Character(','), Modifiers::platform_shortcut());
+    let _ = ui.redraw();
+    let body = ui
+        .runtime()
+        .bounds(&crate::settings::panel::body_id())
+        .expect("the body");
+    let safety = ui
+        .runtime()
+        .bounds(&crate::settings::panel::part_id("safety"))
+        .expect("Output safety");
+    let field = ui
+        .runtime()
+        .bounds(&crate::settings::panel::author_part())
+        .expect("Your name");
+    let (left, right) = (safety.x - body.x, (body.x + body.width) - (field.x + field.width));
+    assert_eq!(left, right, "Preferences: left {left}, right {right}");
+}
+
 /// A double-click on a parameter's slider resets the parameter to its
 /// default, as the runtime's slider rule says (ui-layer.md, section 5,
 /// rule 16), from anywhere on the track.
